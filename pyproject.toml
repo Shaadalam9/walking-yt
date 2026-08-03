@@ -1,0 +1,18 @@
+[project]
+name = "walking-yt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12.13"
+dependencies = [
+    "accelerate>=1.14.0",
+    "bitsandbytes>=0.50.0",
+    "google-api-python-client>=2.197.0",
+    "langdetect>=1.0.9",
+    "numpy>=2.5.1",
+    "pycountry==26.2.16",
+    "pytubefix>=10.10.1",
+    "torch>=2.13.0",
+    "transformers>=5.13.1",
+    "yt-dlp>=2026.7.4",
+]
