@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict
 
 import torch
@@ -14,7 +13,6 @@ from .shared import (
     clean_text,
     log,
     normalise_bool,
-    normalise_string_list,
     optional_text,
     recover_json,
     save_state,
@@ -68,22 +66,13 @@ class TextMetadataJudge:
         include = normalise_bool(data.get("include"))
         confidence = clamp_float(data.get("confidence"), 0.0, 1.0)
         include = include and confidence >= settings.MIN_TEXT_CONFIDENCE
-        iso3 = optional_text(data.get("iso3"))
-        if iso3:
-            iso3 = iso3.upper()
-            if not re.fullmatch(r"[A-Z]{3}", iso3):
-                iso3 = None
-
         return {
             "include": include,
             "confidence": confidence,
             "short_reason": clean_text(data.get("short_reason")),
             "locality": optional_text(data.get("locality")),
-            "locality_aka": normalise_string_list(data.get("locality_aka")),
             "state": optional_text(data.get("state")),
             "country": optional_text(data.get("country")),
-            "iso3": iso3,
-            "continent": optional_text(data.get("continent")),
             "raw_response": answer,
             "error": None,
         }
@@ -95,11 +84,8 @@ class TextMetadataJudge:
             "confidence": 0.0,
             "short_reason": "The text LLM did not return valid JSON.",
             "locality": None,
-            "locality_aka": [],
             "state": None,
             "country": None,
-            "iso3": None,
-            "continent": None,
             "raw_response": answer,
             "error": "json_recovery_failed",
         }
@@ -122,10 +108,8 @@ product reviews, driving tours, cycling tours, bus or train rides, drone
 videos, flights, boat rides, talking head videos, slideshows, maps, static
 ambience, and unrelated uses of the word walking.
 
-Extract the most specific municipality or locality supported by the text.
-Alternative names explicitly present in the text belong in locality_aka.
-For US and Canadian states, prefer the standard abbreviation when known.
-Use the three letter ISO 3166 country code. Do not invent a location. A
+Extract only the most specific locality, state, and country supported by the
+text. Do not infer an ISO code or continent. Do not invent a location. A
 candidate may still be included when it appears to be a valid walking video
 but no location can be found. Return null for unknown location fields.
 
@@ -138,11 +122,8 @@ Return valid JSON only:
   "confidence": 0.0,
   "short_reason": "one short sentence",
   "locality": null,
-  "locality_aka": [],
   "state": null,
-  "country": null,
-  "iso3": null,
-  "continent": null
+  "country": null
 }}
 """.strip()
 

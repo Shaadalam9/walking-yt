@@ -181,6 +181,9 @@ MAX_NEW_CANDIDATES: Optional[int] = env_optional_int(
 MAX_VIDEOS_PER_RUN: Optional[int] = env_optional_int(
     "MAX_VIDEOS_PER_RUN", 20
 )
+MIN_VIDEO_DURATION_SECONDS = env_int(
+    "MIN_VIDEO_DURATION_SECONDS", 300, minimum=1
+)
 PUBLISHED_AFTER = os.environ.get("PUBLISHED_AFTER") or None
 PUBLISHED_BEFORE = os.environ.get("PUBLISHED_BEFORE") or None
 
@@ -197,15 +200,16 @@ VLM_MODEL_NAME = os.environ.get(
     "INTERNVL_MODEL", "OpenGVLab/InternVL3_5-14B-HF"
 ).strip()
 VLM_LOAD_IN_4BIT = env_bool("INTERNVL_4BIT", False)
-TEMPORAL_SAMPLES = env_int("TEMPORAL_SAMPLES", 6, minimum=1)
-SAMPLE_SECONDS = env_int("SAMPLE_SECONDS", 6, minimum=1)
 FRAMES_PER_SAMPLE = env_int("FRAMES_PER_SAMPLE", 6, minimum=1)
 VLM_MAX_NEW_TOKENS = env_int("VLM_MAX_NEW_TOKENS", 320, minimum=1)
-MIN_INCLUDED_SAMPLE_RATIO = env_float(
-    "MIN_INCLUDED_SAMPLE_RATIO", 0.70, minimum=0.0, maximum=1.0
+MIN_CUT_CONFIDENCE = env_float(
+    "MIN_CUT_CONFIDENCE", 0.70, minimum=0.0, maximum=1.0
 )
-MIN_VISUAL_CONFIDENCE = env_float(
-    "MIN_VISUAL_CONFIDENCE", 0.75, minimum=0.0, maximum=1.0
+MIN_SEGMENT_CONFIDENCE = env_float(
+    "MIN_SEGMENT_CONFIDENCE", 0.70, minimum=0.0, maximum=1.0
+)
+CUT_VERIFICATION_SECONDS = env_int(
+    "CUT_VERIFICATION_SECONDS", 6, minimum=2
 )
 
 # Application stage overlap is separate from model tensor parallelism.

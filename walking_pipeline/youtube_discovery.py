@@ -6,8 +6,6 @@ import os
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from googleapiclient.discovery import build  # type: ignore
-
 from . import settings
 from .shared import clean_text, log, optional_text, save_state
 
@@ -80,6 +78,11 @@ def duration_to_seconds(iso_duration: str) -> int:
     return (((days * 24) + hours) * 60 + minutes) * 60 + seconds
 
 
+def video_duration_is_eligible(duration: int) -> bool:
+    """Return whether a video meets the configured minimum duration."""
+    return duration >= settings.MIN_VIDEO_DURATION_SECONDS
+
+
 class YouTubeDiscovery:
     def __init__(self, api_keys: List[str]) -> None:
         if not api_keys:
@@ -92,6 +95,8 @@ class YouTubeDiscovery:
         self.client = self._build_client()
 
     def _build_client(self) -> Any:
+        from googleapiclient.discovery import build  # type: ignore
+
         return build(
             "youtube",
             "v3",
@@ -251,7 +256,7 @@ class YouTubeDiscovery:
                 content = {}
 
             duration = duration_to_seconds(str(content.get("duration", "")))
-            if duration < 60:
+            if not video_duration_is_eligible(duration):
                 continue
 
             videos[video_id] = self._new_video_record(

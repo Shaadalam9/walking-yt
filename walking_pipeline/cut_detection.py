@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from . import settings
-from .shared import clean_text, require_binary, run_command
+from .shared import require_binary, run_command
 
 
 @dataclass
@@ -103,32 +103,9 @@ def merge_nearby_times(times: Sequence[float]) -> List[float]:
     return merged
 
 
-def time_code_for_midpoint(
-    midpoint: float, samples: Sequence[Dict[str, Any]]
-) -> int:
-    valid = [
-        sample
-        for sample in samples
-        if isinstance(sample, dict)
-        and isinstance(sample.get("midpoint"), (int, float))
-    ]
-    if not valid:
-        return settings.TIME_OF_DAY_CODES["unknown"]
-
-    nearest = min(
-        valid,
-        key=lambda sample: abs(float(sample["midpoint"]) - midpoint),
-    )
-    label = clean_text(nearest.get("time_of_day")).lower()
-    return settings.TIME_OF_DAY_CODES.get(
-        label, settings.TIME_OF_DAY_CODES["unknown"]
-    )
-
-
 def build_segments(
     duration: float,
     cut_times: Sequence[float],
-    visual_samples: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     if duration <= 0:
         return []
@@ -146,14 +123,10 @@ def build_segments(
     for end_second in [*integer_cuts, final_second]:
         if end_second < start_second:
             continue
-        midpoint = (start_second + end_second) / 2.0
         segments.append(
             {
                 "start_time": start_second,
                 "end_time": end_second,
-                "time_of_day": time_code_for_midpoint(
-                    midpoint, visual_samples
-                ),
             }
         )
         start_second = end_second + 1
