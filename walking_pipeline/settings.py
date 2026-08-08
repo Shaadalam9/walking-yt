@@ -243,8 +243,12 @@ WORKER_START_TIMEOUT_SECONDS = env_int(
 VIDEO_FORMAT = os.environ.get(
     "WALK_VIDEO_FORMAT",
     (
-        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-        "best[height<=480][ext=mp4]/best[height<=480]/best"
+        "bv*[height=720]+ba/b[height=720]/"
+        "bv*[height=480]+ba/b[height=480]/"
+        "bv*[height=360]+ba/b[height=360]/"
+        "bv*[height=144]+ba/b[height=144]/"
+        "bv*[height<=720]+ba/b[height<=720]/"
+        "bv*+ba/b"
     ),
 )
 KEEP_REJECTED_VIDEOS = env_bool("KEEP_REJECTED_VIDEOS", False)

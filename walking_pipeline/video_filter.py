@@ -90,21 +90,29 @@ def download_video(video_id: str) -> Optional[Path]:
     output_template = str(settings.VIDEO_DIR / f"{video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
     result = run_command(
-        [
-            "yt-dlp",
-            "--no-playlist",
-            "--force-overwrites",
-            "--no-warnings",
-            "-f",
-            settings.VIDEO_FORMAT,
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            output_template,
-            url,
-        ],
-        timeout=1800,
-    )
+    [
+        "yt-dlp",
+        "--no-playlist",
+        "--continue",
+        "--no-warnings",
+        "--cookies-from-browser",
+        "chrome",
+        "--remote-components",
+        "ejs:github",
+        "-f",
+        settings.VIDEO_FORMAT,
+        "-S",
+        "res:720,fps",
+        "--merge-output-format",
+        "mp4",
+        "--remux-video",
+        "mp4",
+        "-o",
+        output_template,
+        url,
+    ],
+    timeout=7200,
+)
     if result.returncode != 0:
         log(f"Download failed for {video_id}: {result.stderr.strip()}")
         return None
@@ -133,6 +141,34 @@ def get_video_duration(video_path: Path) -> Optional[float]:
     except ValueError:
         return None
     return duration if duration > 0 and math.isfinite(duration) else None
+
+
+def get_video_frame_count(video_path: Path) -> Optional[int]:
+    """Return the number of decodable video frames."""
+    require_binary("ffprobe")
+    result = run_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        timeout=60,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        frame_count = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return frame_count if frame_count > 0 else None
 
 
 def create_sample_clip(
@@ -181,8 +217,9 @@ def create_segment_review_clip(
     """Create a compact clip sampling frames across one entire segment."""
     require_binary("ffmpeg")
     segment_duration = max(1.0, float(end_time - start_time + 1))
-    frame_count = max(1, settings.FRAMES_PER_SAMPLE)
-    sample_rate = frame_count / segment_duration
+    target_frame_count = max(1, settings.FRAMES_PER_SAMPLE)
+    encoded_frame_count = target_frame_count * 2
+    sample_rate = encoded_frame_count / segment_duration
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result = run_command(
         [
@@ -200,10 +237,12 @@ def create_segment_review_clip(
             "-vf",
             (
                 f"fps={sample_rate:.10f},"
-                "scale='min(480,iw)':-2,setpts=N/(1*TB)"
+                "scale='min(480,iw)':-2,"
+                "setpts=N/(1*TB),"
+                f"tpad=stop_mode=clone:stop_duration={encoded_frame_count}"
             ),
             "-frames:v",
-            str(frame_count),
+            str(encoded_frame_count),
             "-r",
             "1",
             "-y",
@@ -241,6 +280,10 @@ class InternVLVisualJudge:
         self.processor = AutoProcessor.from_pretrained(
             model_name, trust_remote_code=True
         )
+        self.processor.video_processor.size = {
+            "height": 448,
+            "width": 448,
+        }
         self.model = load_model_with_fallback(
             AutoModelForImageTextToText.from_pretrained,
             model_name,
@@ -261,7 +304,7 @@ class InternVLVisualJudge:
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "url": str(sample_path)},
+                    {"type": "video", "path": str(sample_path)},
                     {
                         "type": "text",
                         "text": self._build_cut_prompt(boundary_time_in_clip),
@@ -270,7 +313,7 @@ class InternVLVisualJudge:
             }
         ]
         try:
-            answer = self._generate(messages)
+            answer = self._generate(messages, sample_path)
         except Exception as exc:
             return self._cut_error(
                 cut_time,
@@ -319,7 +362,7 @@ class InternVLVisualJudge:
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "url": str(sample_path)},
+                    {"type": "video", "path": str(sample_path)},
                     {
                         "type": "text",
                         "text": self._build_segment_prompt(
@@ -335,7 +378,7 @@ class InternVLVisualJudge:
             }
         ]
         try:
-            answer = self._generate(messages)
+            answer = self._generate(messages, sample_path)
         except Exception as exc:
             return self._segment_error(
                 segment_index,
@@ -401,14 +444,29 @@ class InternVLVisualJudge:
             error=None,
         )
 
-    def _generate(self, messages: List[Dict[str, Any]]) -> str:
+    def _generate(
+        self,
+        messages: List[Dict[str, Any]],
+        sample_path: Path,
+    ) -> str:
+        available_frames = get_video_frame_count(sample_path)
+        if available_frames is None:
+            raise RuntimeError(
+                f"Could not determine frame count for {sample_path}"
+            )
+        requested_frames = min(
+            settings.FRAMES_PER_SAMPLE,
+            available_frames,
+        )
         inputs = self.processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-            num_frames=settings.FRAMES_PER_SAMPLE,
+            processor_kwargs={
+                "num_frames": requested_frames,
+            },
         ).to(self.model.device)
         with torch.inference_mode():
             generated = self.model.generate(
@@ -823,6 +881,18 @@ def process_visual_candidate(
         candidate_segments,
         judge,
     )
+    failed_reviews = [
+        review for review in reviews if review.error is not None
+    ]
+    if failed_reviews:
+        record["visual_decision"] = aggregate_segment_reviews(reviews)
+        record["segments"] = []
+        record["status"] = "segment_review_failed"
+        record["error"] = (
+            f"{len(failed_reviews)} segment review call(s) failed"
+        )
+        return
+
     visual_decision = aggregate_segment_reviews(reviews)
     record["visual_decision"] = visual_decision
     record["segments"] = accepted_segments_from_reviews(reviews)
