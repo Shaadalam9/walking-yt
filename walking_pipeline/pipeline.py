@@ -49,7 +49,12 @@ def record_requires_processing(record: Any) -> bool:
         return True
     if not text_decision.get("include"):
         return False
-    return record.get("status") not in FINAL_VIDEO_STATUSES
+    if record.get("status") not in FINAL_VIDEO_STATUSES:
+        return True
+    return (
+        record.get("visual_review_version")
+        != settings.VISUAL_REVIEW_VERSION
+    )
 
 
 def count_unfinished_videos(state: Dict[str, Any]) -> int:

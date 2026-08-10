@@ -93,12 +93,9 @@ def _visual_worker(tasks: TaskQueue, results: ResultQueue) -> None:
     judge: Any = None
     try:
         _configure_cuda_device(settings.VLM_DEVICE)
-        from .video_filter import InternVLVisualJudge, process_visual_candidate
+        from .video_filter import create_visual_judge, process_visual_candidate
 
-        judge = InternVLVisualJudge(
-            settings.VLM_MODEL_NAME,
-            device=settings.VLM_DEVICE,
-        )
+        judge = create_visual_judge(device=settings.VLM_DEVICE)
         results.put({"kind": "ready", "worker": "visual"})
 
         while True:
@@ -158,7 +155,12 @@ def _record_needs_visual_processing(record: Dict[str, Any]) -> bool:
     decision = record.get("text_decision")
     if not isinstance(decision, dict) or not decision.get("include"):
         return False
-    return record.get("status") not in {"complete", "visual_rejected"}
+    if record.get("status") not in {"complete", "visual_rejected"}:
+        return True
+    return (
+        record.get("visual_review_version")
+        != settings.VISUAL_REVIEW_VERSION
+    )
 
 
 def _pending_visual_ids(state: Dict[str, Any]) -> Deque[str]:

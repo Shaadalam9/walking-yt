@@ -16,6 +16,7 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _NONE_VALUES = {"", "none", "null", "unlimited", "all"}
 _VALID_PIPELINE_MODES = {"auto", "sequential", "overlap"}
+_VALID_VISUAL_MODEL_BACKENDS = {"cosmos3", "internvl"}
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -202,6 +203,68 @@ VLM_MODEL_NAME = os.environ.get(
 VLM_LOAD_IN_4BIT = env_bool("INTERNVL_4BIT", False)
 FRAMES_PER_SAMPLE = env_int("FRAMES_PER_SAMPLE", 6, minimum=1)
 VLM_MAX_NEW_TOKENS = env_int("VLM_MAX_NEW_TOKENS", 320, minimum=1)
+VISUAL_MODEL_BACKEND = os.environ.get(
+    "VISUAL_MODEL_BACKEND", "cosmos3"
+).strip().lower()
+if VISUAL_MODEL_BACKEND not in _VALID_VISUAL_MODEL_BACKENDS:
+    allowed_backends = ", ".join(sorted(_VALID_VISUAL_MODEL_BACKENDS))
+    raise ValueError(
+        f"VISUAL_MODEL_BACKEND must be one of: {allowed_backends}. "
+        f"Received: {VISUAL_MODEL_BACKEND!r}"
+    )
+
+COSMOS3_MODEL_NAME = os.environ.get(
+    "COSMOS3_MODEL", "nvidia/Cosmos3-Nano"
+).strip()
+COSMOS3_LOAD_IN_4BIT = env_bool("COSMOS3_4BIT", False)
+COSMOS3_MAX_NEW_TOKENS = env_int(
+    "COSMOS3_MAX_NEW_TOKENS", 256, minimum=1
+)
+COSMOS3_FAST_MODE = env_bool("COSMOS3_FAST_MODE", True)
+COSMOS3_INTRO_SEARCH_SECONDS = env_int(
+    "COSMOS3_INTRO_SEARCH_SECONDS", 90, minimum=15
+)
+COSMOS3_INTRO_FPS = env_float(
+    "COSMOS3_INTRO_FPS", 1.0, minimum=0.25, maximum=4.0
+)
+COSMOS3_MIN_CONTENT_START_CONFIDENCE = env_float(
+    "COSMOS3_MIN_CONTENT_START_CONFIDENCE",
+    0.60,
+    minimum=0.0,
+    maximum=1.0,
+)
+COSMOS3_FRAMES_PER_SAMPLE = env_int(
+    "COSMOS3_FRAMES_PER_SAMPLE", 12, minimum=4
+)
+COSMOS3_REVIEW_FPS = env_float(
+    "COSMOS3_REVIEW_FPS", 1.0, minimum=0.1, maximum=1.0
+)
+COSMOS3_VIDEO_WIDTH = env_int(
+    "COSMOS3_VIDEO_WIDTH", 384, minimum=224, maximum=720
+)
+COSMOS3_MIN_WALKING_FRACTION = env_float(
+    "COSMOS3_MIN_WALKING_FRACTION", 0.50, minimum=0.0, maximum=1.0
+)
+COSMOS3_MAX_PROMOTION_FRACTION = env_float(
+    "COSMOS3_MAX_PROMOTION_FRACTION", 0.40, minimum=0.0, maximum=1.0
+)
+VISUAL_REVIEW_VERSION = (
+    "cosmos3_nano_reasoner_fast_v1"
+    if VISUAL_MODEL_BACKEND == "cosmos3" and COSMOS3_FAST_MODE
+    else f"{VISUAL_MODEL_BACKEND}_scene_cuts_v1"
+)
+MIN_SEGMENT_DURATION_SECONDS = env_int(
+    "MIN_SEGMENT_DURATION_SECONDS", 15, minimum=1
+)
+MAX_SEGMENT_REVIEW_SECONDS = env_int(
+    "MAX_SEGMENT_REVIEW_SECONDS", 300, minimum=1
+)
+if MAX_SEGMENT_REVIEW_SECONDS < (2 * MIN_SEGMENT_DURATION_SECONDS) - 1:
+    raise ValueError(
+        "MAX_SEGMENT_REVIEW_SECONDS must be at least twice "
+        "MIN_SEGMENT_DURATION_SECONDS minus one so long segments can be "
+        "split without creating an undersized remainder."
+    )
 MIN_CUT_CONFIDENCE = env_float(
     "MIN_CUT_CONFIDENCE", 0.70, minimum=0.0, maximum=1.0
 )
