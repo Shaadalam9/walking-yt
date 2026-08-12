@@ -18,6 +18,9 @@ _NONE_VALUES = {"", "none", "null", "unlimited", "all"}
 _VALID_PIPELINE_MODES = {"auto", "sequential", "overlap"}
 _VALID_VISUAL_MODEL_BACKENDS = {"cosmos3", "internvl"}
 
+# Printed during installation checks so mismatched file revisions are obvious.
+SETTINGS_SCHEMA_VERSION = "walking_motion_cut_precision_v7"
+
 
 def env_bool(name: str, default: bool) -> bool:
     """Read a strict Boolean environment variable."""
@@ -237,27 +240,44 @@ COSMOS3_FRAMES_PER_SAMPLE = env_int(
     "COSMOS3_FRAMES_PER_SAMPLE", 12, minimum=4
 )
 COSMOS3_REVIEW_FPS = env_float(
-    "COSMOS3_REVIEW_FPS", 1.0, minimum=0.1, maximum=1.0
+    "COSMOS3_REVIEW_FPS", 2.0, minimum=0.5, maximum=4.0
+)
+COSMOS3_LONG_WINDOW_SECONDS = env_int(
+    "COSMOS3_LONG_WINDOW_SECONDS", 120, minimum=30
+)
+COSMOS3_LONG_WINDOW_BURSTS = env_int(
+    "COSMOS3_LONG_WINDOW_BURSTS", 4, minimum=3, maximum=4
+)
+COSMOS3_LONG_WINDOW_SOURCE_FPS = env_float(
+    "COSMOS3_LONG_WINDOW_SOURCE_FPS", 1.0, minimum=0.25, maximum=2.0
+)
+COSMOS3_CUT_FPS = env_float(
+    "COSMOS3_CUT_FPS", 8.0, minimum=2.0, maximum=8.0
 )
 COSMOS3_VIDEO_WIDTH = env_int(
     "COSMOS3_VIDEO_WIDTH", 384, minimum=224, maximum=720
 )
 COSMOS3_MIN_WALKING_FRACTION = env_float(
-    "COSMOS3_MIN_WALKING_FRACTION", 0.50, minimum=0.0, maximum=1.0
+    "COSMOS3_MIN_WALKING_FRACTION", 0.33, minimum=0.0, maximum=1.0
 )
 COSMOS3_MAX_PROMOTION_FRACTION = env_float(
     "COSMOS3_MAX_PROMOTION_FRACTION", 0.40, minimum=0.0, maximum=1.0
 )
-VISUAL_REVIEW_VERSION = (
-    "cosmos3_nano_reasoner_fast_v1"
-    if VISUAL_MODEL_BACKEND == "cosmos3" and COSMOS3_FAST_MODE
-    else f"{VISUAL_MODEL_BACKEND}_scene_cuts_v1"
-)
+if VISUAL_MODEL_BACKEND == "cosmos3":
+    VISUAL_REVIEW_VERSION = (
+        "cosmos3_nano_reasoner_location_metadata_v11"
+        if COSMOS3_FAST_MODE
+        else "cosmos3_nano_reasoner_hybrid_cuts_location_metadata_v11"
+    )
+else:
+    VISUAL_REVIEW_VERSION = (
+        f"{VISUAL_MODEL_BACKEND}_scene_cuts_location_metadata_v3"
+    )
 MIN_SEGMENT_DURATION_SECONDS = env_int(
     "MIN_SEGMENT_DURATION_SECONDS", 15, minimum=1
 )
 MAX_SEGMENT_REVIEW_SECONDS = env_int(
-    "MAX_SEGMENT_REVIEW_SECONDS", 300, minimum=1
+    "MAX_SEGMENT_REVIEW_SECONDS", 240, minimum=1
 )
 if MAX_SEGMENT_REVIEW_SECONDS < (2 * MIN_SEGMENT_DURATION_SECONDS) - 1:
     raise ValueError(
@@ -272,7 +292,7 @@ MIN_SEGMENT_CONFIDENCE = env_float(
     "MIN_SEGMENT_CONFIDENCE", 0.70, minimum=0.0, maximum=1.0
 )
 CUT_VERIFICATION_SECONDS = env_int(
-    "CUT_VERIFICATION_SECONDS", 6, minimum=2
+    "CUT_VERIFICATION_SECONDS", 2, minimum=2
 )
 
 # Application stage overlap is separate from model tensor parallelism.
@@ -314,6 +334,17 @@ VIDEO_FORMAT = os.environ.get(
         "bv*+ba/b"
     ),
 )
+YT_DLP_COOKIE_FILE = os.environ.get("YT_DLP_COOKIE_FILE", "").strip()
+YT_DLP_COOKIES_FROM_BROWSER = os.environ.get(
+    "YT_DLP_COOKIES_FROM_BROWSER", ""
+).strip()
+if YT_DLP_COOKIES_FROM_BROWSER.lower() in {"", "none", "null", "off"}:
+    YT_DLP_COOKIES_FROM_BROWSER = ""
+if YT_DLP_COOKIE_FILE and YT_DLP_COOKIES_FROM_BROWSER:
+    raise ValueError(
+        "Set only one of YT_DLP_COOKIE_FILE or "
+        "YT_DLP_COOKIES_FROM_BROWSER."
+    )
 KEEP_REJECTED_VIDEOS = env_bool("KEEP_REJECTED_VIDEOS", False)
 
 SCENE_THRESHOLD = env_float(
@@ -355,6 +386,10 @@ OUTPUT_COLUMNS = [
     "lon",
     "videos",
     "time_of_day",
+    "walking_environment",
+    "timestamp_labels",
+    "embedded_location_text",
+    "location_source",
     "start_time",
     "end_time",
     "vehicle_type",

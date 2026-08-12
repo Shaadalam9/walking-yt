@@ -6,10 +6,35 @@ import csv
 import json
 import os
 from datetime import date, datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import settings
 from .shared import normalise_string_list, optional_text
+
+
+OUTPUT_WRITER_SCHEMA_VERSION = "walking_location_csv_v1"
+_LOCATION_OUTPUT_COLUMNS = (
+    "walking_environment",
+    "timestamp_labels",
+    "embedded_location_text",
+    "location_source",
+)
+
+
+def resolved_output_columns() -> List[str]:
+    """Return a compatible CSV schema even with an older settings file."""
+    columns = list(settings.OUTPUT_COLUMNS)
+    insertion_index = (
+        columns.index("start_time")
+        if "start_time" in columns
+        else len(columns)
+    )
+    for column in _LOCATION_OUTPUT_COLUMNS:
+        if column in columns:
+            continue
+        columns.insert(insertion_index, column)
+        insertion_index += 1
+    return columns
 
 
 def location_key(location: Dict[str, Any]) -> str:
@@ -104,6 +129,10 @@ def _new_group(
         "lon": location.get("lon"),
         "videos": [],
         "time_of_day": [],
+        "walking_environment": [],
+        "timestamp_labels": [],
+        "embedded_location_text": [],
+        "location_source": [],
         "start_time": [],
         "end_time": [],
         "vehicle_type": [],
@@ -130,6 +159,34 @@ def _append_video(
     group["time_of_day"].append(
         [
             int(segment.get("time_of_day", -1))
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
+    )
+    group["walking_environment"].append(
+        [
+            str(segment.get("walking_environment", "unknown"))
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
+    )
+    group["timestamp_labels"].append(
+        [
+            segment.get("timestamp_labels", [])
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
+    )
+    group["embedded_location_text"].append(
+        [
+            segment.get("embedded_location_text", [])
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
+    )
+    group["location_source"].append(
+        [
+            str(segment.get("location_source", "none"))
             for segment in segments
             if isinstance(segment, dict)
         ]
@@ -164,7 +221,7 @@ def _write_groups(grouped: Dict[str, Dict[str, Any]]) -> None:
     )
     with temporary_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
-            handle, fieldnames=settings.OUTPUT_COLUMNS
+            handle, fieldnames=resolved_output_columns()
         )
         writer.writeheader()
         for group in sorted(grouped.values(), key=lambda row: row["id"]):
@@ -187,6 +244,14 @@ def _serialise_group(group: Dict[str, Any]) -> Dict[str, Any]:
         "lon": scalar_cell(group["lon"]),
         "videos": json_cell(group["videos"]),
         "time_of_day": json_cell(group["time_of_day"]),
+        "walking_environment": json_cell(
+            group["walking_environment"]
+        ),
+        "timestamp_labels": json_cell(group["timestamp_labels"]),
+        "embedded_location_text": json_cell(
+            group["embedded_location_text"]
+        ),
+        "location_source": json_cell(group["location_source"]),
         "start_time": json_cell(group["start_time"]),
         "end_time": json_cell(group["end_time"]),
         "vehicle_type": json_cell(group["vehicle_type"]),
