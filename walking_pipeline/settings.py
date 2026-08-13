@@ -1,60 +1,54 @@
-"""Environment based configuration for the walking video pipeline.
+"""Validated JSON configuration for the walking video pipeline.
 
-The module deliberately validates environment values at import time. This
-makes misspelled or malformed Run:ai settings fail before large models are
-loaded or data processing begins.
+All user controlled pipeline values come from root entries in the ``config``
+file through ``common.get_configs``. The module validates values at import
+time so configuration errors are reported before models are loaded or videos
+are downloaded.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
+
+from common import get_configs
 
 
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-_FALSE_VALUES = {"0", "false", "no", "off"}
-_NONE_VALUES = {"", "none", "null", "unlimited", "all"}
 _VALID_PIPELINE_MODES = {"auto", "sequential", "overlap"}
 _VALID_VISUAL_MODEL_BACKENDS = {"cosmos3", "internvl"}
 
-# Printed during installation checks so mismatched file revisions are obvious.
-SETTINGS_SCHEMA_VERSION = "walking_motion_cut_precision_v7"
+# Printed during installation checks so mismatched revisions are obvious.
+SETTINGS_SCHEMA_VERSION = "walking_json_config_queue_retention_v10"
 
 
-def env_bool(name: str, default: bool) -> bool:
-    """Read a strict Boolean environment variable."""
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-
-    value = raw_value.strip().lower()
-    if value in _TRUE_VALUES:
-        return True
-    if value in _FALSE_VALUES:
-        return False
-    allowed = ", ".join(sorted(_TRUE_VALUES | _FALSE_VALUES))
-    raise ValueError(
-        f"{name} must be one of: {allowed}. Received: {raw_value!r}"
-    )
+def _config_value(name: str) -> Any:
+    try:
+        return get_configs(name)
+    except KeyError as exc:
+        raise ValueError(
+            f"Missing configuration value in config: {name}"
+        ) from exc
 
 
-def env_int(
+def config_bool(name: str) -> bool:
+    """Read a JSON Boolean configuration value."""
+    value = _config_value(name)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false. Received: {value!r}")
+    return value
+
+
+def config_int(
     name: str,
-    default: int,
     *,
     minimum: Optional[int] = None,
     maximum: Optional[int] = None,
 ) -> int:
-    """Read and range check an integer environment variable."""
-    raw_value = os.environ.get(name, str(default)).strip()
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise ValueError(
-            f"{name} must be an integer. Received: {raw_value!r}"
-        ) from exc
-
+    """Read and range check a JSON integer configuration value."""
+    value = _config_value(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer. Received: {value!r}")
     if minimum is not None and value < minimum:
         raise ValueError(f"{name} must be at least {minimum}. Received: {value}")
     if maximum is not None and value > maximum:
@@ -62,62 +56,68 @@ def env_int(
     return value
 
 
-def env_optional_int(
+def config_optional_int(
     name: str,
-    default: Optional[int],
     *,
     minimum: int = 0,
 ) -> Optional[int]:
-    """Read an optional integer, accepting none or unlimited as no limit."""
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-
-    value = raw_value.strip().lower()
-    if value in _NONE_VALUES:
+    """Read an integer or null from the JSON configuration."""
+    value = _config_value(name)
+    if value is None:
         return None
-    try:
-        number = int(value)
-    except ValueError as exc:
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
-            f"{name} must be an integer or one of: none, unlimited. "
-            f"Received: {raw_value!r}"
-        ) from exc
-    if number < minimum:
-        raise ValueError(
-            f"{name} must be at least {minimum}. Received: {number}"
+            f"{name} must be an integer or null. Received: {value!r}"
         )
-    return number
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}. Received: {value}")
+    return value
 
 
-def env_float(
+def config_float(
     name: str,
-    default: float,
     *,
     minimum: Optional[float] = None,
     maximum: Optional[float] = None,
 ) -> float:
-    """Read and range check a floating point environment variable."""
-    raw_value = os.environ.get(name, str(default)).strip()
-    try:
-        value = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(
-            f"{name} must be a number. Received: {raw_value!r}"
-        ) from exc
-
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}. Received: {value}")
-    if maximum is not None and value > maximum:
-        raise ValueError(f"{name} must be at most {maximum}. Received: {value}")
-    return value
+    """Read and range check a JSON number configuration value."""
+    value = _config_value(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number. Received: {value!r}")
+    number = float(value)
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be at least {minimum}. Received: {number}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be at most {maximum}. Received: {number}")
+    return number
 
 
-def env_device(name: str, default: str) -> str:
-    """Read a torch device, accepting a bare CUDA index such as 0."""
-    value = os.environ.get(name, default).strip().lower()
-    if not value:
+def config_text(name: str, *, allow_empty: bool = False) -> str:
+    """Read and trim a JSON string configuration value."""
+    value = _config_value(name)
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string. Received: {value!r}")
+    text = value.strip()
+    if not text and not allow_empty:
         raise ValueError(f"{name} cannot be empty")
+    return text
+
+
+def config_optional_text(name: str) -> Optional[str]:
+    """Read a nonempty JSON string or null."""
+    value = _config_value(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{name} must be a string or null. Received: {value!r}"
+        )
+    return value.strip() or None
+
+
+def config_device(name: str) -> str:
+    """Read a torch device, accepting a bare CUDA index such as 0."""
+    value = config_text(name).lower()
     if value.isdigit():
         return f"cuda:{value}"
     if value == "cuda":
@@ -125,90 +125,118 @@ def env_device(name: str, default: str) -> str:
     return value
 
 
-def _data_child_path(name: str, default: str) -> Path:
-    value = Path(os.environ.get(name, default)).expanduser()
+def config_text_list(name: str) -> List[str]:
+    """Read a nonempty list of unique nonempty strings."""
+    value = _config_value(name)
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a JSON list. Received: {value!r}")
+
+    result: List[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"Every {name} entry must be a nonempty string. "
+                f"Received: {item!r}"
+            )
+        text = item.strip()
+        if text not in result:
+            result.append(text)
+    if not result:
+        raise ValueError(f"{name} must contain at least one value")
+    return result
+
+
+def _data_child_path(name: str) -> Path:
+    value = Path(config_text(name)).expanduser()
     return value if value.is_absolute() else DATA_DIR / value
 
 
-SPIKE1_MODE = env_bool("SPIKE1_MODE", False)
-SPIKE1_REQUIRE_GPU = env_bool("SPIKE1_REQUIRE_GPU", SPIKE1_MODE)
-SPIKE1_REQUIRE_PERSISTENT_STORAGE = env_bool(
-    "SPIKE1_REQUIRE_PERSISTENT_STORAGE", SPIKE1_MODE
+def _set_process_environment(name: str, value: Optional[str]) -> None:
+    """Apply config backed values required by third party libraries."""
+    if value:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
+
+
+SPIKE1_MODE = config_bool("SPIKE1_MODE")
+SPIKE1_REQUIRE_GPU = config_bool("SPIKE1_REQUIRE_GPU")
+SPIKE1_REQUIRE_PERSISTENT_STORAGE = config_bool(
+    "SPIKE1_REQUIRE_PERSISTENT_STORAGE"
 )
 
-DATA_DIR = Path(os.environ.get("WALK_DATA_DIR", "data")).expanduser()
-STATE_JSON = _data_child_path(
-    "WALK_STATE_JSON", "walking_pipeline_state.json"
-)
-OUTPUT_CSV = _data_child_path("WALK_OUTPUT_CSV", "walking_segments.csv")
-VIDEO_DIR = _data_child_path("WALK_VIDEO_DIR", "walking_videos")
-GEOCODE_CACHE_JSON = _data_child_path(
-    "WALK_GEOCODE_CACHE", "walking_geocode_cache.json"
-)
+DATA_DIR = Path(config_text("WALK_DATA_DIR")).expanduser()
+STATE_JSON = _data_child_path("WALK_STATE_JSON")
+OUTPUT_CSV = _data_child_path("WALK_OUTPUT_CSV")
+VIDEO_DIR = _data_child_path("WALK_VIDEO_DIR")
+GEOCODE_CACHE_JSON = _data_child_path("WALK_GEOCODE_CACHE")
 
 _default_hf_home = (
     DATA_DIR.parent / "huggingface"
     if SPIKE1_MODE
     else Path.home() / ".cache" / "huggingface"
 )
-HF_HOME = Path(os.environ.get("HF_HOME", str(_default_hf_home))).expanduser()
-HF_HUB_CACHE = Path(
-    os.environ.get("HF_HUB_CACHE", str(HF_HOME / "hub"))
-).expanduser()
-
-# Transformers reads these variables itself. Setting defaults here ensures
-# model downloads are kept on persistent storage in Spike 1 mode.
-os.environ.setdefault("HF_HOME", str(HF_HOME))
-os.environ.setdefault("HF_HUB_CACHE", str(HF_HUB_CACHE))
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-DEFAULT_WALKING_QUERIES = [
-    "walking tour",
-    "city walk",
-    "walk with me",
-    "virtual walk",
-    "4k walking tour",
-    "POV walking",
-    "street walk",
-    "nature walk",
-    "rain walk",
-    "night walk",
-]
-
-MAX_PAGES_PER_QUERY = env_int("MAX_PAGES_PER_QUERY", 2, minimum=1)
-RESULTS_PER_PAGE = env_int(
-    "RESULTS_PER_PAGE", 50, minimum=1, maximum=50
+_configured_hf_home = config_optional_text("HF_HOME")
+HF_HOME = (
+    Path(_configured_hf_home).expanduser()
+    if _configured_hf_home
+    else _default_hf_home
 )
-MAX_NEW_CANDIDATES: Optional[int] = env_optional_int(
-    "MAX_NEW_CANDIDATES", 200
-)
-MAX_VIDEOS_PER_RUN: Optional[int] = env_optional_int(
-    "MAX_VIDEOS_PER_RUN", 20
-)
-MIN_VIDEO_DURATION_SECONDS = env_int(
-    "MIN_VIDEO_DURATION_SECONDS", 300, minimum=1
-)
-PUBLISHED_AFTER = os.environ.get("PUBLISHED_AFTER") or None
-PUBLISHED_BEFORE = os.environ.get("PUBLISHED_BEFORE") or None
-
-TEXT_MODEL_NAME = os.environ.get(
-    "TEXT_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"
-).strip()
-TEXT_LOAD_IN_4BIT = env_bool("TEXT_LLM_4BIT", False)
-TEXT_MAX_NEW_TOKENS = env_int("TEXT_MAX_NEW_TOKENS", 384, minimum=1)
-MIN_TEXT_CONFIDENCE = env_float(
-    "MIN_TEXT_CONFIDENCE", 0.60, minimum=0.0, maximum=1.0
+_configured_hf_hub_cache = config_optional_text("HF_HUB_CACHE")
+HF_HUB_CACHE = (
+    Path(_configured_hf_hub_cache).expanduser()
+    if _configured_hf_hub_cache
+    else HF_HOME / "hub"
 )
 
-VLM_MODEL_NAME = os.environ.get(
-    "INTERNVL_MODEL", "OpenGVLab/InternVL3_5-14B-HF"
-).strip()
-VLM_LOAD_IN_4BIT = env_bool("INTERNVL_4BIT", False)
-FRAMES_PER_SAMPLE = env_int("FRAMES_PER_SAMPLE", 6, minimum=1)
-VLM_MAX_NEW_TOKENS = env_int("VLM_MAX_NEW_TOKENS", 320, minimum=1)
-VISUAL_MODEL_BACKEND = os.environ.get(
-    "VISUAL_MODEL_BACKEND", "cosmos3"
-).strip().lower()
+# These libraries still consume process environment variables internally, but
+# their values are controlled exclusively by the JSON config file.
+_set_process_environment("HF_HOME", str(HF_HOME))
+_set_process_environment("HF_HUB_CACHE", str(HF_HUB_CACHE))
+_set_process_environment(
+    "TOKENIZERS_PARALLELISM",
+    "true" if config_bool("TOKENIZERS_PARALLELISM") else "false",
+)
+_set_process_environment(
+    "HF_XET_HIGH_PERFORMANCE",
+    "1" if config_bool("HF_XET_HIGH_PERFORMANCE") else "0",
+)
+_set_process_environment(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    config_optional_text("PYTORCH_CUDA_ALLOC_CONF"),
+)
+
+DEFAULT_WALKING_QUERIES = config_text_list("WALKING_QUERIES")
+MAX_PAGES_PER_QUERY = config_int("MAX_PAGES_PER_QUERY", minimum=1)
+RESULTS_PER_PAGE = config_int(
+    "RESULTS_PER_PAGE", minimum=1, maximum=50
+)
+MAX_NEW_CANDIDATES = config_optional_int("MAX_NEW_CANDIDATES")
+MAX_VIDEOS_PER_RUN = config_optional_int("MAX_VIDEOS_PER_RUN")
+VIDEO_DOWNLOAD_QUEUE_SIZE = config_int(
+    "VIDEO_DOWNLOAD_QUEUE_SIZE", minimum=1
+)
+KEEP_VIDEO_FILES_AFTER_ANALYSIS = config_bool(
+    "KEEP_VIDEO_FILES_AFTER_ANALYSIS"
+)
+MIN_VIDEO_DURATION_SECONDS = config_int(
+    "MIN_VIDEO_DURATION_SECONDS", minimum=1
+)
+PUBLISHED_AFTER = config_optional_text("PUBLISHED_AFTER")
+PUBLISHED_BEFORE = config_optional_text("PUBLISHED_BEFORE")
+
+TEXT_MODEL_NAME = config_text("TEXT_LLM_MODEL")
+TEXT_LOAD_IN_4BIT = config_bool("TEXT_LLM_4BIT")
+TEXT_MAX_NEW_TOKENS = config_int("TEXT_MAX_NEW_TOKENS", minimum=1)
+MIN_TEXT_CONFIDENCE = config_float(
+    "MIN_TEXT_CONFIDENCE", minimum=0.0, maximum=1.0
+)
+
+VLM_MODEL_NAME = config_text("INTERNVL_MODEL")
+VLM_LOAD_IN_4BIT = config_bool("INTERNVL_4BIT")
+FRAMES_PER_SAMPLE = config_int("FRAMES_PER_SAMPLE", minimum=1)
+VLM_MAX_NEW_TOKENS = config_int("VLM_MAX_NEW_TOKENS", minimum=1)
+VISUAL_MODEL_BACKEND = config_text("VISUAL_MODEL_BACKEND").lower()
 if VISUAL_MODEL_BACKEND not in _VALID_VISUAL_MODEL_BACKENDS:
     allowed_backends = ", ".join(sorted(_VALID_VISUAL_MODEL_BACKENDS))
     raise ValueError(
@@ -216,52 +244,49 @@ if VISUAL_MODEL_BACKEND not in _VALID_VISUAL_MODEL_BACKENDS:
         f"Received: {VISUAL_MODEL_BACKEND!r}"
     )
 
-COSMOS3_MODEL_NAME = os.environ.get(
-    "COSMOS3_MODEL", "nvidia/Cosmos3-Nano"
-).strip()
-COSMOS3_LOAD_IN_4BIT = env_bool("COSMOS3_4BIT", False)
-COSMOS3_MAX_NEW_TOKENS = env_int(
-    "COSMOS3_MAX_NEW_TOKENS", 256, minimum=1
+COSMOS3_MODEL_NAME = config_text("COSMOS3_MODEL")
+COSMOS3_LOAD_IN_4BIT = config_bool("COSMOS3_4BIT")
+COSMOS3_MAX_NEW_TOKENS = config_int(
+    "COSMOS3_MAX_NEW_TOKENS", minimum=1
 )
-COSMOS3_FAST_MODE = env_bool("COSMOS3_FAST_MODE", True)
-COSMOS3_INTRO_SEARCH_SECONDS = env_int(
-    "COSMOS3_INTRO_SEARCH_SECONDS", 90, minimum=15
+COSMOS3_FAST_MODE = config_bool("COSMOS3_FAST_MODE")
+COSMOS3_INTRO_SEARCH_SECONDS = config_int(
+    "COSMOS3_INTRO_SEARCH_SECONDS", minimum=15
 )
-COSMOS3_INTRO_FPS = env_float(
-    "COSMOS3_INTRO_FPS", 1.0, minimum=0.25, maximum=4.0
+COSMOS3_INTRO_FPS = config_float(
+    "COSMOS3_INTRO_FPS", minimum=0.25, maximum=4.0
 )
-COSMOS3_MIN_CONTENT_START_CONFIDENCE = env_float(
+COSMOS3_MIN_CONTENT_START_CONFIDENCE = config_float(
     "COSMOS3_MIN_CONTENT_START_CONFIDENCE",
-    0.60,
     minimum=0.0,
     maximum=1.0,
 )
-COSMOS3_FRAMES_PER_SAMPLE = env_int(
-    "COSMOS3_FRAMES_PER_SAMPLE", 12, minimum=4
+COSMOS3_FRAMES_PER_SAMPLE = config_int(
+    "COSMOS3_FRAMES_PER_SAMPLE", minimum=4
 )
-COSMOS3_REVIEW_FPS = env_float(
-    "COSMOS3_REVIEW_FPS", 2.0, minimum=0.5, maximum=4.0
+COSMOS3_REVIEW_FPS = config_float(
+    "COSMOS3_REVIEW_FPS", minimum=0.5, maximum=4.0
 )
-COSMOS3_LONG_WINDOW_SECONDS = env_int(
-    "COSMOS3_LONG_WINDOW_SECONDS", 120, minimum=30
+COSMOS3_LONG_WINDOW_SECONDS = config_int(
+    "COSMOS3_LONG_WINDOW_SECONDS", minimum=30
 )
-COSMOS3_LONG_WINDOW_BURSTS = env_int(
-    "COSMOS3_LONG_WINDOW_BURSTS", 4, minimum=3, maximum=4
+COSMOS3_LONG_WINDOW_BURSTS = config_int(
+    "COSMOS3_LONG_WINDOW_BURSTS", minimum=3, maximum=4
 )
-COSMOS3_LONG_WINDOW_SOURCE_FPS = env_float(
-    "COSMOS3_LONG_WINDOW_SOURCE_FPS", 1.0, minimum=0.25, maximum=2.0
+COSMOS3_LONG_WINDOW_SOURCE_FPS = config_float(
+    "COSMOS3_LONG_WINDOW_SOURCE_FPS", minimum=0.25, maximum=2.0
 )
-COSMOS3_CUT_FPS = env_float(
-    "COSMOS3_CUT_FPS", 8.0, minimum=2.0, maximum=8.0
+COSMOS3_CUT_FPS = config_float(
+    "COSMOS3_CUT_FPS", minimum=2.0, maximum=8.0
 )
-COSMOS3_VIDEO_WIDTH = env_int(
-    "COSMOS3_VIDEO_WIDTH", 384, minimum=224, maximum=720
+COSMOS3_VIDEO_WIDTH = config_int(
+    "COSMOS3_VIDEO_WIDTH", minimum=224, maximum=720
 )
-COSMOS3_MIN_WALKING_FRACTION = env_float(
-    "COSMOS3_MIN_WALKING_FRACTION", 0.33, minimum=0.0, maximum=1.0
+COSMOS3_MIN_WALKING_FRACTION = config_float(
+    "COSMOS3_MIN_WALKING_FRACTION", minimum=0.0, maximum=1.0
 )
-COSMOS3_MAX_PROMOTION_FRACTION = env_float(
-    "COSMOS3_MAX_PROMOTION_FRACTION", 0.40, minimum=0.0, maximum=1.0
+COSMOS3_MAX_PROMOTION_FRACTION = config_float(
+    "COSMOS3_MAX_PROMOTION_FRACTION", minimum=0.0, maximum=1.0
 )
 if VISUAL_MODEL_BACKEND == "cosmos3":
     VISUAL_REVIEW_VERSION = (
@@ -273,11 +298,12 @@ else:
     VISUAL_REVIEW_VERSION = (
         f"{VISUAL_MODEL_BACKEND}_scene_cuts_location_metadata_v3"
     )
-MIN_SEGMENT_DURATION_SECONDS = env_int(
-    "MIN_SEGMENT_DURATION_SECONDS", 15, minimum=1
+
+MIN_SEGMENT_DURATION_SECONDS = config_int(
+    "MIN_SEGMENT_DURATION_SECONDS", minimum=1
 )
-MAX_SEGMENT_REVIEW_SECONDS = env_int(
-    "MAX_SEGMENT_REVIEW_SECONDS", 240, minimum=1
+MAX_SEGMENT_REVIEW_SECONDS = config_int(
+    "MAX_SEGMENT_REVIEW_SECONDS", minimum=1
 )
 if MAX_SEGMENT_REVIEW_SECONDS < (2 * MIN_SEGMENT_DURATION_SECONDS) - 1:
     raise ValueError(
@@ -285,18 +311,17 @@ if MAX_SEGMENT_REVIEW_SECONDS < (2 * MIN_SEGMENT_DURATION_SECONDS) - 1:
         "MIN_SEGMENT_DURATION_SECONDS minus one so long segments can be "
         "split without creating an undersized remainder."
     )
-MIN_CUT_CONFIDENCE = env_float(
-    "MIN_CUT_CONFIDENCE", 0.70, minimum=0.0, maximum=1.0
+MIN_CUT_CONFIDENCE = config_float(
+    "MIN_CUT_CONFIDENCE", minimum=0.0, maximum=1.0
 )
-MIN_SEGMENT_CONFIDENCE = env_float(
-    "MIN_SEGMENT_CONFIDENCE", 0.70, minimum=0.0, maximum=1.0
+MIN_SEGMENT_CONFIDENCE = config_float(
+    "MIN_SEGMENT_CONFIDENCE", minimum=0.0, maximum=1.0
 )
-CUT_VERIFICATION_SECONDS = env_int(
-    "CUT_VERIFICATION_SECONDS", 2, minimum=2
+CUT_VERIFICATION_SECONDS = config_int(
+    "CUT_VERIFICATION_SECONDS", minimum=2
 )
 
-# Application stage overlap is separate from model tensor parallelism.
-PIPELINE_MODE = os.environ.get("PIPELINE_MODE", "auto").strip().lower()
+PIPELINE_MODE = config_text("PIPELINE_MODE").lower()
 if PIPELINE_MODE not in _VALID_PIPELINE_MODES:
     allowed_modes = ", ".join(sorted(_VALID_PIPELINE_MODES))
     raise ValueError(
@@ -304,65 +329,47 @@ if PIPELINE_MODE not in _VALID_PIPELINE_MODES:
         f"Received: {PIPELINE_MODE!r}"
     )
 
-# Run:ai presents allocated GPUs as logical cuda:0, cuda:1, and so on inside
-# the container, even when their physical host identifiers are different.
-SEQUENTIAL_DEVICE = env_device("SEQUENTIAL_DEVICE", "cuda:0")
-TEXT_DEVICE = env_device("TEXT_DEVICE", "cuda:0")
-VLM_DEVICE = env_device("VLM_DEVICE", "cuda:1")
-TEXT_MAX_OUTSTANDING = env_int(
-    "TEXT_MAX_OUTSTANDING", 16, minimum=1
+SEQUENTIAL_DEVICE = config_device("SEQUENTIAL_DEVICE")
+TEXT_DEVICE = config_device("TEXT_DEVICE")
+VLM_DEVICE = config_device("VLM_DEVICE")
+TEXT_MAX_OUTSTANDING = config_int("TEXT_MAX_OUTSTANDING", minimum=1)
+VISUAL_MAX_OUTSTANDING = config_int(
+    "VISUAL_MAX_OUTSTANDING", minimum=1
 )
-# Two outstanding visual jobs means one is running and one is waiting.
-VISUAL_MAX_OUTSTANDING = env_int(
-    "VISUAL_MAX_OUTSTANDING", 2, minimum=1
-)
-WORKER_POLL_SECONDS = env_float(
-    "WORKER_POLL_SECONDS", 0.10, minimum=0.01
-)
-WORKER_START_TIMEOUT_SECONDS = env_int(
-    "WORKER_START_TIMEOUT_SECONDS", 1800, minimum=30
+WORKER_POLL_SECONDS = config_float("WORKER_POLL_SECONDS", minimum=0.01)
+WORKER_START_TIMEOUT_SECONDS = config_int(
+    "WORKER_START_TIMEOUT_SECONDS", minimum=30
 )
 
-VIDEO_FORMAT = os.environ.get(
-    "WALK_VIDEO_FORMAT",
-    (
-        "bv*[height=720]+ba/b[height=720]/"
-        "bv*[height=480]+ba/b[height=480]/"
-        "bv*[height=360]+ba/b[height=360]/"
-        "bv*[height=144]+ba/b[height=144]/"
-        "bv*[height<=720]+ba/b[height<=720]/"
-        "bv*+ba/b"
-    ),
+VIDEO_FORMAT = config_text("WALK_VIDEO_FORMAT")
+_cookie_file = config_optional_text("YT_DLP_COOKIE_FILE")
+YT_DLP_COOKIE_FILE = (
+    str(Path(_cookie_file).expanduser()) if _cookie_file else ""
 )
-YT_DLP_COOKIE_FILE = os.environ.get("YT_DLP_COOKIE_FILE", "").strip()
-YT_DLP_COOKIES_FROM_BROWSER = os.environ.get(
-    "YT_DLP_COOKIES_FROM_BROWSER", ""
-).strip()
-if YT_DLP_COOKIES_FROM_BROWSER.lower() in {"", "none", "null", "off"}:
-    YT_DLP_COOKIES_FROM_BROWSER = ""
+YT_DLP_COOKIES_FROM_BROWSER = (
+    config_optional_text("YT_DLP_COOKIES_FROM_BROWSER") or ""
+)
 if YT_DLP_COOKIE_FILE and YT_DLP_COOKIES_FROM_BROWSER:
     raise ValueError(
         "Set only one of YT_DLP_COOKIE_FILE or "
-        "YT_DLP_COOKIES_FROM_BROWSER."
+        "YT_DLP_COOKIES_FROM_BROWSER in config."
     )
-KEEP_REJECTED_VIDEOS = env_bool("KEEP_REJECTED_VIDEOS", False)
 
-SCENE_THRESHOLD = env_float(
-    "SCENE_THRESHOLD", 0.45, minimum=0.0, maximum=1.0
+SCENE_THRESHOLD = config_float(
+    "SCENE_THRESHOLD", minimum=0.0, maximum=1.0
 )
-MERGE_NEARBY_SEC = env_float("MERGE_NEARBY_SEC", 2.0, minimum=0.0)
-IGNORE_FIRST_SEC = env_float("IGNORE_FIRST_SEC", 0.0, minimum=0.0)
-IGNORE_LAST_SEC = env_float("IGNORE_LAST_SEC", 0.0, minimum=0.0)
-CUT_DETECTION_TIMEOUT = env_int(
-    "CUT_DETECTION_TIMEOUT", 7200, minimum=1
+SCDET_THRESHOLD = config_float(
+    "SCDET_THRESHOLD", minimum=0.0, maximum=100.0
 )
+MERGE_NEARBY_SEC = config_float("MERGE_NEARBY_SEC", minimum=0.0)
+IGNORE_FIRST_SEC = config_float("IGNORE_FIRST_SEC", minimum=0.0)
+IGNORE_LAST_SEC = config_float("IGNORE_LAST_SEC", minimum=0.0)
+CUT_DETECTION_TIMEOUT = config_int("CUT_DETECTION_TIMEOUT", minimum=1)
 
-ENABLE_GEOCODING = env_bool("ENABLE_GEOCODING", True)
-GEOCODER_USER_AGENT = os.environ.get(
-    "GEOCODER_USER_AGENT", "walking-video-research-pipeline/1.0"
-).strip()
-GEOCODER_DELAY_SECONDS = env_float(
-    "GEOCODER_DELAY_SECONDS", 1.1, minimum=0.0
+ENABLE_GEOCODING = config_bool("ENABLE_GEOCODING")
+GEOCODER_USER_AGENT = config_text("GEOCODER_USER_AGENT")
+GEOCODER_DELAY_SECONDS = config_float(
+    "GEOCODER_DELAY_SECONDS", minimum=0.0
 )
 
 TIME_OF_DAY_CODES = {
@@ -371,7 +378,6 @@ TIME_OF_DAY_CODES = {
     "dawn_dusk": 2,
     "unknown": -1,
 }
-PEDESTRIAN_VEHICLE_TYPE = 0
 FIRST_LOCALITY_ID = 1
 
 OUTPUT_COLUMNS = [
@@ -392,7 +398,6 @@ OUTPUT_COLUMNS = [
     "location_source",
     "start_time",
     "end_time",
-    "vehicle_type",
     "upload_date",
     "channel",
 ]

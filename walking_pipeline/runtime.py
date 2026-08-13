@@ -185,15 +185,11 @@ def _check_writable_directory(path: Path, label: str) -> None:
 def validate_storage() -> None:
     """Validate persistent data and model cache paths before processing."""
     if settings.SPIKE1_REQUIRE_PERSISTENT_STORAGE:
-        if "WALK_DATA_DIR" not in os.environ:
-            raise RuntimeError(
-                "SPIKE1_REQUIRE_PERSISTENT_STORAGE=1 requires WALK_DATA_DIR "
-                "to be set to the mounted DDN path."
-            )
         if not settings.DATA_DIR.is_absolute():
             raise RuntimeError(
-                "WALK_DATA_DIR must be an absolute mounted path in Spike 1 "
-                f"mode. Received: {settings.DATA_DIR}"
+                "WALK_DATA_DIR in config must be an absolute mounted path "
+                "in Spike 1 mode. "
+                f"Received: {settings.DATA_DIR}"
             )
 
         persistent_outputs = {
@@ -206,7 +202,8 @@ def validate_storage() -> None:
             if not _is_within(path, settings.DATA_DIR):
                 raise RuntimeError(
                     f"{variable_name} resolves outside WALK_DATA_DIR: {path}. "
-                    "Spike 1 output files must remain on persistent storage."
+                    "Update the output paths in config so Spike 1 "
+                    "outputs remain on persistent storage."
                 )
 
     _check_writable_directory(settings.DATA_DIR, "WALK_DATA_DIR")

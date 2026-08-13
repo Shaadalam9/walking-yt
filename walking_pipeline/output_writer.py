@@ -12,7 +12,7 @@ from . import settings
 from .shared import normalise_string_list, optional_text
 
 
-OUTPUT_WRITER_SCHEMA_VERSION = "walking_location_csv_v1"
+OUTPUT_WRITER_SCHEMA_VERSION = "walking_bracket_csv_v2"
 _LOCATION_OUTPUT_COLUMNS = (
     "walking_environment",
     "timestamp_labels",
@@ -23,7 +23,11 @@ _LOCATION_OUTPUT_COLUMNS = (
 
 def resolved_output_columns() -> List[str]:
     """Return a compatible CSV schema even with an older settings file."""
-    columns = list(settings.OUTPUT_COLUMNS)
+    columns = [
+        column
+        for column in settings.OUTPUT_COLUMNS
+        if column != "vehicle_type"
+    ]
     insertion_index = (
         columns.index("start_time")
         if "start_time" in columns
@@ -63,12 +67,58 @@ def format_upload_date(value: Any) -> Optional[int]:
             return None
 
 
-def json_cell(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def _bracket_text(value: Any) -> str:
+    """Return one readable scalar without list delimiter ambiguity."""
+    return (
+        str(value)
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace('"', "'")
+        .replace("[", "(")
+        .replace("]", ")")
+        .replace(",", ";")
+        .strip()
+    )
+
+
+def bracket_cell(value: Any) -> str:
+    """Encode aligned CSV values using non-JSON square brackets.
+
+    Timestamp dictionaries use the compact order
+    [timestamp_seconds,timestamp_text,label]. Text commas become semicolons
+    so commas remain unambiguous list separators without quoting each item.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(bracket_cell(item) for item in value) + "]"
+    if isinstance(value, dict):
+        timestamp_keys = (
+            "timestamp_seconds",
+            "timestamp_text",
+            "label",
+        )
+        if any(key in value for key in timestamp_keys):
+            items = [value.get(key) for key in timestamp_keys]
+        else:
+            items = [
+                f"{_bracket_text(key)}={bracket_cell(item)}"
+                for key, item in value.items()
+            ]
+        return "[" + ",".join(bracket_cell(item) for item in items) + "]"
+    return _bracket_text(value)
 
 
 def scalar_cell(value: Any) -> Any:
-    return "None" if value is None or value == "" else value
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value.replace("\r", " ").replace("\n", " ").replace(
+            '"', "'"
+        )
+    return value
 
 
 def write_output_csv(state: Dict[str, Any]) -> None:
@@ -135,7 +185,6 @@ def _new_group(
         "location_source": [],
         "start_time": [],
         "end_time": [],
-        "vehicle_type": [],
         "upload_date": [],
         "channel": [],
     }
@@ -205,8 +254,6 @@ def _append_video(
             if isinstance(segment, dict)
         ]
     )
-    group["vehicle_type"].append(settings.PEDESTRIAN_VEHICLE_TYPE)
-
     metadata = record.get("metadata", {})
     group["upload_date"].append(
         format_upload_date(metadata.get("upload_date"))
@@ -235,26 +282,25 @@ def _serialise_group(group: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": group["id"],
         "locality": scalar_cell(group["locality"]),
-        "locality_aka": json_cell(group["locality_aka"]),
+        "locality_aka": bracket_cell(group["locality_aka"]),
         "state": scalar_cell(group["state"]),
         "country": scalar_cell(group["country"]),
         "iso3": scalar_cell(group["iso3"]),
         "continent": scalar_cell(group["continent"]),
         "lat": scalar_cell(group["lat"]),
         "lon": scalar_cell(group["lon"]),
-        "videos": json_cell(group["videos"]),
-        "time_of_day": json_cell(group["time_of_day"]),
-        "walking_environment": json_cell(
+        "videos": bracket_cell(group["videos"]),
+        "time_of_day": bracket_cell(group["time_of_day"]),
+        "walking_environment": bracket_cell(
             group["walking_environment"]
         ),
-        "timestamp_labels": json_cell(group["timestamp_labels"]),
-        "embedded_location_text": json_cell(
+        "timestamp_labels": bracket_cell(group["timestamp_labels"]),
+        "embedded_location_text": bracket_cell(
             group["embedded_location_text"]
         ),
-        "location_source": json_cell(group["location_source"]),
-        "start_time": json_cell(group["start_time"]),
-        "end_time": json_cell(group["end_time"]),
-        "vehicle_type": json_cell(group["vehicle_type"]),
-        "upload_date": json_cell(group["upload_date"]),
-        "channel": json_cell(group["channel"]),
+        "location_source": bracket_cell(group["location_source"]),
+        "start_time": bracket_cell(group["start_time"]),
+        "end_time": bracket_cell(group["end_time"]),
+        "upload_date": bracket_cell(group["upload_date"]),
+        "channel": bracket_cell(group["channel"]),
     }

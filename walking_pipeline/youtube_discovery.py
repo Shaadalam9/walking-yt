@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -10,23 +9,20 @@ from . import settings
 from .shared import clean_text, log, optional_text, save_state
 
 
-def load_api_keys() -> List[str]:
-    raw = (
-        os.environ.get("YOUTUBE_API_KEYS")
-        or os.environ.get("YOUTUBE_API_KEY")
-        or ""
-    )
-    if not raw:
-        try:
-            import common  # type: ignore
+YOUTUBE_DISCOVERY_SCHEMA_VERSION = "walking_json_config_v1"
 
-            raw = (
-                common.get_secrets("google-api-keys")
-                or common.get_secrets("google-api-key")
-                or ""
-            )
-        except Exception:
-            raw = ""
+
+def load_api_keys() -> List[str]:
+    raw: Any = ""
+    try:
+        import common  # type: ignore
+
+        try:
+            raw = common.get_secrets("google-api-keys")
+        except KeyError:
+            raw = common.get_secrets("google-api-key")
+    except Exception:
+        raw = ""
 
     if isinstance(raw, str):
         candidates: Iterable[Any] = re.split(r"[;,\n]+", raw)
@@ -87,8 +83,8 @@ class YouTubeDiscovery:
     def __init__(self, api_keys: List[str]) -> None:
         if not api_keys:
             raise RuntimeError(
-                "No YouTube API key found. Set YOUTUBE_API_KEYS or "
-                "YOUTUBE_API_KEY."
+                "No YouTube API key found. Add google-api-keys or "
+                "google-api-key to the root secret file."
             )
         self.api_keys = api_keys
         self.key_index = 0
@@ -135,7 +131,7 @@ class YouTubeDiscovery:
                 raise
 
     def discover(self, state: Dict[str, Any]) -> int:
-        queries = split_queries(os.environ.get("WALKING_QUERIES"))
+        queries = list(settings.DEFAULT_WALKING_QUERIES)
         published_after = normalise_published_bound(settings.PUBLISHED_AFTER)
         published_before = normalise_published_bound(settings.PUBLISHED_BEFORE)
         videos: Dict[str, Any] = state.setdefault("videos", {})

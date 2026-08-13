@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import gc
 import math
+import queue
 import re
 import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -34,7 +36,7 @@ from .shared import (
 )
 
 
-VIDEO_FILTER_SCHEMA_VERSION = "walking_motion_cut_precision_v7"
+VIDEO_FILTER_SCHEMA_VERSION = "walking_download_queue_retention_v8"
 
 _SEGMENT_CONTENT_TYPES = {
     "walking",
@@ -2342,10 +2344,11 @@ def aggregate_segment_reviews(
     }
 
 
-def process_visual_candidate(
+def _process_visual_candidate(
     video_id: str,
     record: Dict[str, Any],
     judge: Any,
+    video_path: Optional[Path] = None,
 ) -> None:
     previous_review_version = record.get("visual_review_version")
     previous_visual_decision = record.get("visual_decision")
@@ -2367,8 +2370,11 @@ def process_visual_candidate(
         )
     review_metadata = dict(metadata)
     review_metadata["_timestamp_labels"] = timestamp_labels
-    log(f"Downloading accepted metadata candidate {video_id}")
-    video_path = download_video(video_id)
+    if video_path is None:
+        log(f"Downloading accepted metadata candidate {video_id}")
+        video_path = download_video(video_id)
+    else:
+        log(f"Using prefetched video {video_id}: {video_path.name}")
     if video_path is None:
         record["status"] = "download_failed"
         record["error"] = "yt-dlp could not download the video"
@@ -2379,7 +2385,6 @@ def process_visual_candidate(
     if duration is None:
         record["status"] = "duration_failed"
         record["error"] = "ffprobe could not determine the duration"
-        remove_video_if_required(video_path)
         return
 
     record["duration_seconds"] = round(duration, 3)
@@ -2389,7 +2394,6 @@ def process_visual_candidate(
             "downloaded video is shorter than "
             f"{settings.MIN_VIDEO_DURATION_SECONDS} seconds"
         )
-        remove_video_if_required(video_path)
         return
 
     use_cosmos = settings.VISUAL_MODEL_BACKEND == "cosmos3"
@@ -2560,20 +2564,140 @@ def process_visual_candidate(
             else "visual_rejected"
         )
         record["error"] = visual_decision.get("error")
-        remove_video_if_required(video_path)
         return
 
     record["status"] = "complete"
     record["error"] = None
 
 
-def remove_video_if_required(video_path: Optional[Path]) -> None:
-    if settings.KEEP_REJECTED_VIDEOS or video_path is None:
+_FINISHED_ANALYSIS_STATUSES = {"complete", "visual_rejected"}
+
+
+def _record_video_path(
+    record: Dict[str, Any],
+    prefetched_path: Optional[Path],
+) -> Optional[Path]:
+    path_value = record.get("local_video_path")
+    if isinstance(path_value, str) and path_value.strip():
+        return Path(path_value)
+    return prefetched_path
+
+
+def _finalise_analysed_video_file(
+    record: Dict[str, Any],
+    prefetched_path: Optional[Path],
+) -> None:
+    if record.get("status") not in _FINISHED_ANALYSIS_STATUSES:
         return
+
+    video_path = _record_video_path(record, prefetched_path)
+    if video_path is None:
+        record["video_file_kept"] = False
+        return
+
+    if settings.KEEP_VIDEO_FILES_AFTER_ANALYSIS:
+        record["video_file_kept"] = video_path.exists()
+        return
+
     try:
         video_path.unlink()
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        record["video_file_kept"] = video_path.exists()
+        record["video_file_cleanup_error"] = str(exc)
+        log(f"Could not delete analysed video {video_path}: {exc}")
+        return
+
+    record["local_video_path"] = None
+    record["video_file_kept"] = False
+    record.pop("video_file_cleanup_error", None)
+    log(f"Deleted analysed video file: {video_path}")
+
+
+def process_visual_candidate(
+    video_id: str,
+    record: Dict[str, Any],
+    judge: Any,
+    video_path: Optional[Path] = None,
+) -> None:
+    """Analyse one video and apply the configured file retention policy."""
+    record["status"] = "visual_processing"
+    try:
+        _process_visual_candidate(video_id, record, judge, video_path)
+    finally:
+        _finalise_analysed_video_file(record, video_path)
+
+
+DownloadQueueItem = Tuple[
+    str,
+    Dict[str, Any],
+    Optional[Path],
+    Optional[str],
+]
+
+
+def _fill_download_queue(
+    pending: List[Tuple[str, Dict[str, Any]]],
+    ready_queue: "queue.Queue[DownloadQueueItem]",
+    stop_event: threading.Event,
+    producer_finished: threading.Event,
+) -> None:
+    try:
+        for video_id, record in pending:
+            if stop_event.is_set():
+                break
+
+            video_path: Optional[Path] = None
+            download_error: Optional[str] = None
+            try:
+                log(f"Prefetching accepted metadata candidate {video_id}")
+                video_path = download_video(video_id)
+                if video_path is None:
+                    download_error = "yt-dlp could not download the video"
+            except Exception as exc:
+                download_error = str(exc)
+                log(f"Video prefetch failed for {video_id}: {exc}")
+
+            item = (video_id, record, video_path, download_error)
+            while not stop_event.is_set():
+                try:
+                    ready_queue.put(item, timeout=0.25)
+                    break
+                except queue.Full:
+                    continue
+    finally:
+        producer_finished.set()
+
+
+def _next_downloaded_video(
+    ready_queue: "queue.Queue[DownloadQueueItem]",
+    producer_finished: threading.Event,
+) -> DownloadQueueItem:
+    while True:
+        try:
+            return ready_queue.get(timeout=0.50)
+        except queue.Empty:
+            if producer_finished.is_set():
+                raise RuntimeError(
+                    "The video download worker stopped before every pending "
+                    "video produced a result."
+                )
+
+
+def _wait_for_initial_download_buffer(
+    ready_queue: "queue.Queue[DownloadQueueItem]",
+    producer_finished: threading.Event,
+    target: int,
+) -> None:
+    while ready_queue.qsize() < target:
+        if producer_finished.wait(timeout=0.10):
+            break
+
+    log(
+        f"Initial download queue ready: {ready_queue.qsize()}/{target} "
+        "video(s)"
+    )
 
 
 def run_visual_stage(
@@ -2600,12 +2724,66 @@ def run_visual_stage(
     if not pending:
         return 0
 
-    judge = create_visual_judge()
+    # One extra slot ensures that, while one video is being analysed, the
+    # configured number can remain downloaded and waiting whenever enough
+    # pending videos exist.
+    queue_capacity = settings.VIDEO_DOWNLOAD_QUEUE_SIZE + 1
+    ready_queue: "queue.Queue[DownloadQueueItem]" = queue.Queue(
+        maxsize=queue_capacity
+    )
+    stop_event = threading.Event()
+    producer_finished = threading.Event()
+    producer = threading.Thread(
+        target=_fill_download_queue,
+        args=(pending, ready_queue, stop_event, producer_finished),
+        name="walking-video-prefetch",
+        daemon=True,
+    )
+    producer.start()
+
+    log(
+        "Video download queue target: "
+        f"{settings.VIDEO_DOWNLOAD_QUEUE_SIZE} waiting video(s); "
+        "keep analysed files="
+        f"{settings.KEEP_VIDEO_FILES_AFTER_ANALYSIS}"
+    )
+
+    judge: Any = None
     processed = 0
     try:
-        for video_id, record in pending:
+        judge = create_visual_judge()
+        initial_target = min(queue_capacity, len(pending))
+        _wait_for_initial_download_buffer(
+            ready_queue,
+            producer_finished,
+            initial_target,
+        )
+
+        for _ in pending:
+            (
+                video_id,
+                record,
+                video_path,
+                download_error,
+            ) = _next_downloaded_video(ready_queue, producer_finished)
             try:
-                process_visual_candidate(video_id, record, judge)
+                if video_path is None:
+                    record["visual_review_version"] = (
+                        settings.VISUAL_REVIEW_VERSION
+                    )
+                    record["status"] = "download_failed"
+                    record["error"] = (
+                        download_error
+                        or "yt-dlp could not download the video"
+                    )
+                    log(f"Download failed for {video_id}: {record['error']}")
+                else:
+                    process_visual_candidate(
+                        video_id,
+                        record,
+                        judge,
+                        video_path,
+                    )
             except KeyboardInterrupt:
                 save_state(state)
                 raise
@@ -2619,5 +2797,8 @@ def run_visual_stage(
                 after_video(state)
             processed += 1
     finally:
-        unload_model(judge)
+        stop_event.set()
+        producer.join(timeout=1.0)
+        if judge is not None:
+            unload_model(judge)
     return processed
