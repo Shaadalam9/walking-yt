@@ -40,7 +40,7 @@ def cuda_index(device: str) -> Optional[int]:
 def cuda_device_count() -> int:
     """Return the number of CUDA devices visible to this container."""
     try:
-        import torch
+        import torch  # type: ignore
 
         if not torch.cuda.is_available():
             return 0
@@ -112,8 +112,8 @@ def resolve_execution_plan() -> ExecutionPlan:
     )
     overlap_devices_are_visible = (
         overlap_devices_are_distinct
-        and text_index < gpu_count
-        and visual_index < gpu_count
+        and text_index < gpu_count  # type: ignore
+        and visual_index < gpu_count  # type: ignore
     )
 
     if settings.PIPELINE_MODE == "overlap":

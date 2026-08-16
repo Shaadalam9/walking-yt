@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-import torch
+import torch  # type: ignore
 
 from . import settings
 from .model_loading import load_model_with_fallback

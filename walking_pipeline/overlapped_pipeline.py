@@ -29,7 +29,7 @@ def _configure_cuda_device(device: str) -> None:
     index = cuda_index(device)
     if index is None:
         return
-    import torch
+    import torch  # type: ignore
 
     torch.cuda.set_device(index)
 
@@ -411,14 +411,14 @@ def run_overlapped_stages(
         text_process.join(timeout=60)
         visual_process.join(timeout=60)
         if text_process.is_alive() or visual_process.is_alive():
-            _terminate_processes(processes)
+            _terminate_processes(processes)  # type: ignore
     except KeyboardInterrupt:
         save_state(state)
-        _terminate_processes(processes)
+        _terminate_processes(processes)  # type: ignore
         raise
     except BaseException:
         save_state(state)
-        _terminate_processes(processes)
+        _terminate_processes(processes)  # type: ignore
         raise
     finally:
         for task_queue in (text_tasks, visual_tasks):

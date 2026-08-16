@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import torch
+import torch  # type: ignore
 
 from . import settings
 from .cut_detection import (
@@ -140,6 +140,7 @@ class DownloadProducerStats:
     failures: int = 0
     stop_reason: str = ""
 
+
 _DIRECT_EDIT_REASON_MARKERS = (
     "black screen",
     "title card",
@@ -222,7 +223,7 @@ def extract_description_timestamp_labels(
 
     chapter_regions: List[str] = []
     for heading in _CHAPTER_HEADING_PATTERN.finditer(description):
-        remainder = description[heading.end() :]
+        remainder = description[heading.end():]
         first_timestamp = _TIMESTAMP_PATTERN.search(remainder)
         if first_timestamp is None or first_timestamp.start() > 160:
             continue
@@ -242,7 +243,7 @@ def extract_description_timestamp_labels(
     labels: List[Dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     for index, match in enumerate(matches):
-        prefix = description[max(0, match.start() - 48) : match.start()]
+        prefix = description[max(0, match.start() - 48): match.start()]
         prefix = prefix.strip().lower()
         if any(
             marker in prefix
@@ -264,7 +265,7 @@ def extract_description_timestamp_labels(
             if index + 1 < len(matches)
             else len(description)
         )
-        raw_label = description[match.end() : next_start]
+        raw_label = description[match.end(): next_start]
         raw_label = re.split(
             r"(?:-{5,}|https?://|video duration\s*:|shooting time\s*:|"
             r"weather\s*:|watch also\s*:)",
@@ -2388,7 +2389,7 @@ def verify_cut_candidates(
 
             for batch_start in range(0, len(prepared), batch_size):
                 batch_entries = prepared[
-                    batch_start : batch_start + batch_size
+                    batch_start: batch_start + batch_size
                 ]
                 batch_jobs: List[CutReviewJob] = []
                 batch_job_indices: List[int] = []
@@ -2662,7 +2663,7 @@ def review_segments(
             stop_after_index: Optional[int] = None
             for batch_start in range(0, len(prepared), batch_size):
                 batch_entries = prepared[
-                    batch_start : batch_start + batch_size
+                    batch_start: batch_start + batch_size
                 ]
                 batch_jobs: List[SegmentReviewJob] = []
                 batch_job_indices: List[int] = []

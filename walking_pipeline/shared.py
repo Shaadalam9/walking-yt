@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import torch
+import torch  # type: ignore
 
 from . import settings
 
@@ -127,7 +127,7 @@ def recover_json(text: str) -> Optional[Dict[str, Any]]:
     last = candidate.rfind("}")
     if first >= 0 and last > first:
         try:
-            data = json.loads(candidate[first : last + 1])
+            data = json.loads(candidate[first: last + 1])
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, TypeError):

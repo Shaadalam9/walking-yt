@@ -226,8 +226,8 @@ def _apply_coordinates(
     resolved: Dict[str, Any], geocode_result: Dict[str, Any]
 ) -> None:
     try:
-        resolved["lat"] = round(float(geocode_result.get("lat")), 7)
-        resolved["lon"] = round(float(geocode_result.get("lon")), 7)
+        resolved["lat"] = round(float(geocode_result.get("lat")), 7)  # type: ignore
+        resolved["lon"] = round(float(geocode_result.get("lon")), 7)  # type: ignore
     except (TypeError, ValueError):
         resolved["lat"] = None
         resolved["lon"] = None

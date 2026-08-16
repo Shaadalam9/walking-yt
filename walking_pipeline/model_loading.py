@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 from typing import Any, Callable, Dict, Tuple
 
-import torch
+import torch  # type: ignore
 
 from .shared import log
 

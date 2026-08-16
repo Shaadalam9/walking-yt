@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1.7
+
+FROM nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04
+
+ARG APP_UID=20234844
+ARG APP_GID=20234844
+ARG PYTHON_VERSION=3.12.13
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    SPIKE_DOCKERFILE_SCHEMA_VERSION=walking_spike_triton_compiler_v4 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CC=/usr/bin/gcc \
+    CXX=/usr/bin/g++ \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    DENO_INSTALL=/usr/local \
+    PATH=/opt/venv/bin:/usr/local/bin:${PATH}
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        libglib2.0-0 \
+        libgl1 \
+        tini \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && install -m 0755 /root/.local/bin/uv /usr/local/bin/uv \
+    && install -m 0755 /root/.local/bin/uvx /usr/local/bin/uvx \
+    && rm -rf /root/.local
+
+RUN curl -fsSL https://deno.land/install.sh | sh \
+    && deno --version \
+    && ffmpeg -version \
+    && "${CC}" --version \
+    && "${CXX}" --version
+
+RUN groupadd --gid "${APP_GID}" walking \
+    && useradd \
+        --uid "${APP_UID}" \
+        --gid "${APP_GID}" \
+        --create-home \
+        --shell /bin/bash \
+        walking
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock README.md ./
+
+RUN uv python install "${PYTHON_VERSION}" \
+    && uv sync --frozen --no-dev --no-install-project
+
+COPY . /app
+
+RUN uv sync --frozen --no-dev \
+    && /opt/venv/bin/python -c \
+        "import torch; from torchcodec.decoders import VideoDecoder; print(torch.__version__)" \
+    && mkdir -p \
+        /mnt/walking-yt \
+        /run/config/walking-yt \
+        /run/secrets/walking-yt \
+    && rm -f /app/config /app/secret \
+    && ln -s /run/config/walking-yt/config /app/config \
+    && ln -s /run/secrets/walking-yt/secret /app/secret \
+    && chown -R "${APP_UID}:${APP_GID}" \
+        /app \
+        /mnt/walking-yt \
+        /opt/venv \
+        /opt/uv-python
+
+RUN --mount=type=secret,id=walking_config,target=/tmp/walking_config,required=true \
+    --mount=type=secret,id=walking_secret,target=/tmp/walking_secret,required=true \
+    --mount=type=secret,id=youtube_cookies,target=/tmp/youtube_cookies,required=true \
+    install -m 0600 -o "${APP_UID}" -g "${APP_GID}" \
+        /tmp/walking_config \
+        /run/config/walking-yt/config \
+    && install -m 0600 -o "${APP_UID}" -g "${APP_GID}" \
+        /tmp/walking_secret \
+        /run/secrets/walking-yt/secret \
+    && install -m 0600 -o "${APP_UID}" -g "${APP_GID}" \
+        /tmp/youtube_cookies \
+        /run/secrets/walking-yt/cookies.txt \
+    && test -s /run/config/walking-yt/config \
+    && test -s /run/secrets/walking-yt/secret \
+    && test -s /run/secrets/walking-yt/cookies.txt
+
+USER 20234844:20234844
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/opt/venv/bin/python", "main.py"]
