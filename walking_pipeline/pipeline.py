@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict
 
 from . import settings
@@ -11,7 +12,10 @@ from .output_writer import write_output_csv
 from .overlapped_pipeline import run_overlapped_stages
 from .runtime import ExecutionPlan, validate_runtime
 from .shared import empty_state, load_json, log, require_binary, save_state
-from .video_filter import run_visual_stage
+from .video_filter import (
+    reset_video_download_temp_directory,
+    run_visual_stage,
+)
 from .youtube_discovery import YouTubeDiscovery, load_api_keys
 
 
@@ -20,6 +24,8 @@ FINAL_VIDEO_STATUSES = {
     "text_rejected",
     "visual_rejected",
 }
+
+PIPELINE_SCHEMA_VERSION = "walking_incremental_location_csv_v2"
 
 
 def validate_environment() -> ExecutionPlan:
@@ -98,15 +104,30 @@ def _run_model_stages(
     )
     text_processed = run_text_stage(state)
     visual_processed = run_visual_stage(
-        state, after_video=write_output_csv
+        state, after_video=_write_incremental_output
     )
     return text_processed, visual_processed
 
 
-def main() -> None:
-    execution_plan = validate_environment()
-    state = load_state()
+def _write_incremental_output(state: Dict[str, Any]) -> None:
+    """Resolve completed video locations before refreshing the CSV."""
+    locations_processed = run_location_stage(
+        state, complete_only=True
+    )
+    if locations_processed:
+        log(
+            "Locations resolved before incremental CSV update: "
+            f"{locations_processed}"
+        )
+    write_output_csv(state)
 
+
+def _run_cycle(
+    state: Dict[str, Any],
+    execution_plan: ExecutionPlan,
+    cycle_number: int,
+) -> tuple[int, int, int, int]:
+    log(f"Starting pipeline cycle {cycle_number}")
     discovered = discover_if_batch_complete(state)
     log(f"New YouTube candidates discovered: {discovered}")
 
@@ -116,7 +137,9 @@ def main() -> None:
     log(f"Candidates processed by the text LLM: {text_processed}")
     log(f"Videos processed visually this run: {visual_processed}")
 
-    locations_processed = run_location_stage(state)
+    locations_processed = run_location_stage(
+        state, complete_only=True
+    )
     log(f"Locations processed: {locations_processed}")
 
     write_output_csv(state)
@@ -131,13 +154,78 @@ def main() -> None:
     if unfinished:
         log(
             "Existing discovery batch still has unfinished videos: "
-            f"{unfinished}. The next run will continue this batch without "
+            f"{unfinished}. The next cycle will continue this batch without "
             "calling the YouTube API."
         )
     else:
         log(
-            "The current discovery batch is complete. The next run may "
+            "The current discovery batch is complete. The next cycle may "
             "discover a new batch."
         )
     log(f"Detailed state: {settings.STATE_JSON}")
     log(f"Locality CSV: {settings.OUTPUT_CSV}")
+    return discovered, text_processed, visual_processed, unfinished
+
+
+def _pause_before_next_cycle(seconds: int, reason: str) -> None:
+    if seconds <= 0:
+        return
+    log(f"{reason} Waiting {seconds} second(s) before the next cycle.")
+    time.sleep(seconds)
+
+
+def main() -> None:
+    execution_plan = validate_environment()
+    reset_video_download_temp_directory()
+    state = load_state()
+
+    if settings.CONTINUOUS_BATCH_MODE:
+        limit = settings.MAX_NEW_CANDIDATES
+        limit_text = "unlimited" if limit is None else str(limit)
+        log(
+            "Continuous batch mode enabled: up to "
+            f"{limit_text} new candidate(s) per discovery batch"
+        )
+
+    cycle_number = 0
+    try:
+        while True:
+            cycle_number += 1
+            (
+                discovered,
+                text_processed,
+                visual_processed,
+                unfinished,
+            ) = _run_cycle(state, execution_plan, cycle_number)
+
+            if not settings.CONTINUOUS_BATCH_MODE:
+                return
+
+            made_progress = any(
+                (discovered, text_processed, visual_processed)
+            )
+            if not made_progress:
+                _pause_before_next_cycle(
+                    settings.CONTINUOUS_IDLE_PAUSE_SECONDS,
+                    "The cycle made no progress.",
+                )
+                continue
+
+            if unfinished:
+                reason = (
+                    "Continuing the existing discovery batch with "
+                    f"{unfinished} unfinished video(s)."
+                )
+            else:
+                reason = "Starting the next discovery batch."
+            _pause_before_next_cycle(
+                settings.CONTINUOUS_BATCH_PAUSE_SECONDS,
+                reason,
+            )
+    except KeyboardInterrupt:
+        write_output_csv(state)
+        save_state(state)
+        log(
+            "Continuous processing stopped by the user. Current state "
+            "and CSV output were saved."
+        )

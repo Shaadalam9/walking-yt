@@ -49,6 +49,8 @@ OCEANIA_CODES = set(
 )
 ANTARCTICA_CODES = {"AQ", "TF"}
 
+LOCATION_SCHEMA_VERSION = "walking_incremental_location_v1"
+
 
 def continent_from_iso2(iso2: Optional[str]) -> Optional[str]:
     code = clean_text(iso2).upper()
@@ -251,13 +253,20 @@ def _apply_alternative_names(
     ]
 
 
-def run_location_stage(state: Dict[str, Any]) -> int:
+def run_location_stage(
+    state: Dict[str, Any],
+    *,
+    complete_only: bool = False,
+) -> int:
+    """Resolve locations, optionally limiting work to completed videos."""
     cache = load_json(settings.GEOCODE_CACHE_JSON, {})
     if not isinstance(cache, dict):
         cache = {}
 
     processed = 0
     for video_id, record in state.get("videos", {}).items():
+        if complete_only and record.get("status") != "complete":
+            continue
         decision = record.get("text_decision")
         if not isinstance(decision, dict) or not decision.get("include"):
             continue

@@ -6,8 +6,10 @@ import gc
 import math
 import queue
 import re
+import shutil
 import tempfile
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -36,10 +38,14 @@ from .shared import (
 )
 
 
-VIDEO_FILTER_SCHEMA_VERSION = "walking_download_queue_retention_v8"
+VIDEO_FILTER_SCHEMA_VERSION = "walking_single_gpu_throughput_v20"
+
+_TEMP_DIRECTORY_LOCK = threading.Lock()
+_TEMP_DIRECTORY_READY = False
 
 _SEGMENT_CONTENT_TYPES = {
     "walking",
+    "drone_aerial",
     "advertisement",
     "channel_promotion",
     "intro_highlights",
@@ -49,6 +55,7 @@ _SEGMENT_CONTENT_TYPES = {
 
 _BURST_CONTENT_TYPES = {
     "walking",
+    "drone_aerial",
     "vehicle",
     "static",
     "highlight",
@@ -99,6 +106,13 @@ _COOKIE_EXTRACTION_ERROR_MARKERS = (
     "cookie database",
 )
 
+_YOUTUBE_AUTHENTICATION_ERROR_MARKERS = (
+    "sign in to confirm you’re not a bot",
+    "sign in to confirm you're not a bot",
+    "login required",
+    "authentication required",
+)
+
 _AMBIGUOUS_CUT_REASON_MARKERS = (
     "change in perspective",
     "change in subject focus",
@@ -110,6 +124,21 @@ _AMBIGUOUS_CUT_REASON_MARKERS = (
     "camera shifts abruptly",
     "abrupt shift",
 )
+
+
+@dataclass(frozen=True)
+class VideoDownloadResult:
+    path: Optional[Path]
+    error: Optional[str] = None
+    authentication_error: bool = False
+
+
+@dataclass
+class DownloadProducerStats:
+    attempts: int = 0
+    successes: int = 0
+    failures: int = 0
+    stop_reason: str = ""
 
 _DIRECT_EDIT_REASON_MARKERS = (
     "black screen",
@@ -371,6 +400,7 @@ class SegmentReview:
     raw_response: str
     walking_fraction: float = 0.0
     promotion_fraction: float = 0.0
+    drone_aerial_fraction: float = 0.0
     decision_method: str = "single_label"
     burst_content: List[str] = field(default_factory=list)
     walking_environment: str = "unknown"
@@ -380,12 +410,68 @@ class SegmentReview:
     error: Optional[str] = None
 
 
-def find_downloaded_video(video_id: str) -> Optional[Path]:
-    if not settings.VIDEO_DIR.exists():
+@dataclass(frozen=True)
+class CutReviewJob:
+    sample_path: Path
+    cut_time: float
+    clip_start_time: float
+    boundary_time_in_clip: float
+
+
+@dataclass(frozen=True)
+class SegmentReviewJob:
+    sample_path: Path
+    metadata: Dict[str, Any]
+    segment_index: int
+    segment_count: int
+    start_time: int
+    end_time: int
+    video_duration: float
+
+
+def _reset_video_download_temp_directory_unlocked() -> None:
+    global _TEMP_DIRECTORY_READY
+
+    if settings.VIDEO_TMP_DIR.exists():
+        if settings.VIDEO_TMP_DIR.is_dir():
+            shutil.rmtree(settings.VIDEO_TMP_DIR)
+        else:
+            settings.VIDEO_TMP_DIR.unlink()
+    settings.VIDEO_TMP_DIR.mkdir(parents=True, exist_ok=False)
+    _TEMP_DIRECTORY_READY = True
+
+
+def reset_video_download_temp_directory() -> None:
+    """Remove stale partial downloads and recreate the safe temp directory."""
+    with _TEMP_DIRECTORY_LOCK:
+        _reset_video_download_temp_directory_unlocked()
+    log(
+        "Reset temporary video download directory: "
+        f"{settings.VIDEO_TMP_DIR}"
+    )
+
+
+def _ensure_video_download_temp_directory() -> None:
+    with _TEMP_DIRECTORY_LOCK:
+        if _TEMP_DIRECTORY_READY:
+            return
+        _reset_video_download_temp_directory_unlocked()
+    log(
+        "Initialised temporary video download directory: "
+        f"{settings.VIDEO_TMP_DIR}"
+    )
+
+
+def find_downloaded_video(
+    video_id: str,
+    directory: Optional[Path] = None,
+) -> Optional[Path]:
+    search_directory = directory or settings.VIDEO_DIR
+    if not search_directory.exists():
         return None
     candidates = sorted(
         path
-        for path in settings.VIDEO_DIR.glob(f"{video_id}.*")
+        for path in search_directory.glob(f"{video_id}.*")
         if path.suffix.lower() in settings.VIDEO_EXTENSIONS
     )
     candidates.sort(key=lambda path: (path.stem != video_id, path.name))
@@ -444,8 +530,24 @@ def _yt_dlp_download_command(
         "--continue",
         "--no-warnings",
         *cookie_args,
+        "--js-runtimes",
+        settings.YT_DLP_JS_RUNTIME,
         "--remote-components",
-        "ejs:github",
+        settings.YT_DLP_REMOTE_COMPONENT,
+        "--retries",
+        str(settings.YT_DLP_RETRIES),
+        "--fragment-retries",
+        str(settings.YT_DLP_FRAGMENT_RETRIES),
+        "--file-access-retries",
+        str(settings.YT_DLP_FILE_ACCESS_RETRIES),
+        "--retry-sleep",
+        f"http:{settings.YT_DLP_RETRY_SLEEP}",
+        "--retry-sleep",
+        f"fragment:{settings.YT_DLP_FRAGMENT_RETRY_SLEEP}",
+        "--http-chunk-size",
+        settings.YT_DLP_HTTP_CHUNK_SIZE,
+        "--socket-timeout",
+        str(settings.YT_DLP_SOCKET_TIMEOUT_SECONDS),
         "-f",
         settings.VIDEO_FORMAT,
         "-S",
@@ -465,44 +567,127 @@ def _is_cookie_extraction_error(result: Any) -> bool:
     return any(marker in output for marker in _COOKIE_EXTRACTION_ERROR_MARKERS)
 
 
-def download_video(video_id: str) -> Optional[Path]:
+def _is_youtube_authentication_error(result: Any) -> bool:
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return any(
+        marker in output
+        for marker in _YOUTUBE_AUTHENTICATION_ERROR_MARKERS
+    )
+
+
+def _download_error_text(result: Any) -> str:
+    error_text = clean_text(result.stderr) or clean_text(result.stdout)
+    return error_text or "yt-dlp could not download the video"
+
+
+def download_video_with_result(video_id: str) -> VideoDownloadResult:
     require_binary("yt-dlp")
     existing = find_downloaded_video(video_id)
     if existing:
-        return existing
+        return VideoDownloadResult(path=existing)
 
+    _ensure_video_download_temp_directory()
     settings.VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    output_template = str(settings.VIDEO_DIR / f"{video_id}.%(ext)s")
+    video_temp_dir = settings.VIDEO_TMP_DIR / video_id
+    video_temp_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(video_temp_dir / f"{video_id}.%(ext)s")
     cookie_args = _yt_dlp_cookie_args()
-    result = run_command(
-        _yt_dlp_download_command(
-            video_id,
-            output_template,
-            cookie_args,
-        ),
-        timeout=7200,
-    )
-    if (
-        result.returncode != 0
-        and settings.YT_DLP_COOKIES_FROM_BROWSER
-        and _is_cookie_extraction_error(result)
-    ):
-        log(
-            "Browser cookie extraction failed; retrying this public video "
-            "once without browser cookies"
-        )
+    result: Any = None
+    for attempt in range(1, settings.YT_DLP_DOWNLOAD_ATTEMPTS + 1):
         result = run_command(
             _yt_dlp_download_command(
                 video_id,
                 output_template,
-                ["--no-cookies-from-browser"],
+                cookie_args,
             ),
-            timeout=7200,
+            timeout=settings.YT_DLP_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+        if (
+            result.returncode != 0
+            and settings.YT_DLP_COOKIES_FROM_BROWSER
+            and _is_cookie_extraction_error(result)
+        ):
+            log(
+                "Browser cookie extraction failed; retrying this public "
+                "video once without browser cookies"
+            )
+            result = run_command(
+                _yt_dlp_download_command(
+                    video_id,
+                    output_template,
+                    ["--no-cookies-from-browser"],
+                ),
+                timeout=settings.YT_DLP_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+
+        if result.returncode == 0:
+            break
+        if _is_youtube_authentication_error(result):
+            break
+        if attempt < settings.YT_DLP_DOWNLOAD_ATTEMPTS:
+            log(
+                f"Download transfer failed for {video_id}; resuming with "
+                f"full attempt {attempt + 1}/"
+                f"{settings.YT_DLP_DOWNLOAD_ATTEMPTS}"
+            )
+
+    if result is None:
+        return VideoDownloadResult(
+            path=None,
+            error="yt-dlp did not return a download result",
         )
     if result.returncode != 0:
-        log(f"Download failed for {video_id}: {result.stderr.strip()}")
-        return None
-    return find_downloaded_video(video_id)
+        return VideoDownloadResult(
+            path=None,
+            error=_download_error_text(result),
+            authentication_error=_is_youtube_authentication_error(result),
+        )
+
+    temporary_video_path = find_downloaded_video(
+        video_id,
+        video_temp_dir,
+    )
+    if temporary_video_path is None:
+        return VideoDownloadResult(
+            path=None,
+            error=(
+                "yt-dlp completed but no downloaded file with a video "
+                "stream was found"
+            ),
+        )
+
+    final_video_path = settings.VIDEO_DIR / temporary_video_path.name
+    try:
+        temporary_video_path.replace(final_video_path)
+    except OSError as exc:
+        return VideoDownloadResult(
+            path=None,
+            error=(
+                "Downloaded video passed validation but could not be moved "
+                f"into the analysis directory: {exc}"
+            ),
+        )
+
+    try:
+        shutil.rmtree(video_temp_dir)
+    except OSError as exc:
+        log(
+            "Downloaded video was moved successfully, but its temporary "
+            f"directory could not be removed: {exc}"
+        )
+
+    log(
+        "Download validated and moved into the analysis directory: "
+        f"{final_video_path.name}"
+    )
+    return VideoDownloadResult(path=final_video_path)
+
+
+def download_video(video_id: str) -> Optional[Path]:
+    result = download_video_with_result(video_id)
+    if result.path is None:
+        log(f"Download failed for {video_id}: {result.error}")
+    return result.path
 
 
 def get_video_duration(video_path: Path) -> Optional[float]:
@@ -964,7 +1149,16 @@ class InternVLVisualJudge:
         if content_type not in _SEGMENT_CONTENT_TYPES:
             content_type = "unclear"
 
-        is_walking = normalise_bool(data.get("is_walking_video"))
+        is_drone_aerial = (
+            normalise_bool(data.get("is_drone_aerial"))
+            or content_type == "drone_aerial"
+        )
+        if is_drone_aerial:
+            content_type = "drone_aerial"
+        is_walking = (
+            normalise_bool(data.get("is_walking_video"))
+            and not is_drone_aerial
+        )
         is_advertisement = normalise_bool(
             data.get("is_advertisement")
         ) or content_type in {"advertisement", "channel_promotion"}
@@ -979,6 +1173,7 @@ class InternVLVisualJudge:
             and content_type == "walking"
             and not is_advertisement
             and not is_intro_highlights
+            and not is_drone_aerial
             and confidence >= settings.MIN_SEGMENT_CONFIDENCE
         )
         walking_environment = normalise_walking_environment(
@@ -1009,6 +1204,7 @@ class InternVLVisualJudge:
             embedded_location_text=embedded_location_text,
             short_reason=clean_text(data.get("short_reason")),
             raw_response=answer,
+            drone_aerial_fraction=1.0 if is_drone_aerial else 0.0,
             error=None,
         )
 
@@ -1169,10 +1365,21 @@ material. Also reject opening highlight reels, previews, recaps, and teaser
 sequences that summarise footage shown later in the video. Use the segment's
 position and duration as context when judging opening highlights.
 
-Reject vehicle, bicycle, drone, boat, train, bus, static, talking head, game,
-animation, slideshow, or screen recording content. Classify time_of_day from
-the visual evidence in this segment only as day, night, dawn_dusk, or unknown.
-Indoor or ambiguous footage must be unknown.
+Reject vehicle, bicycle, drone, aerial flyover, boat, train, bus, static,
+talking head, game, animation, slideshow, or screen recording content. Drone
+or aerial footage includes smooth floating or flying motion above streets,
+roofs, buildings, coastlines, rivers, or other scenery. It also includes an
+elevated camera panning, tilting, or zooming without pedestrian height forward
+progression. Do not infer indoor walking merely because scenery is seen
+through or beside a window. Genuine walking must show motion at pedestrian
+height along a visible or strongly implied walkable surface, with nearby
+parallax and progression consistent with travel on foot.
+
+Set is_drone_aerial true and content_type to drone_aerial whenever this is
+drone or aerial footage. This is a hard exclusion even if part of the sampled
+clip resembles walking. Classify time_of_day from the visual evidence in this
+segment only as day, night, dawn_dusk, or unknown. Indoor or ambiguous footage
+must be unknown.
 
 For genuine walking, classify walking_environment as exactly one of street,
 indoor, beach, park_nature, trail, market, waterfront, square_plaza,
@@ -1192,6 +1399,7 @@ Return valid JSON only:
   "include": true,
   "confidence": 0.85,
   "is_walking_video": true,
+  "is_drone_aerial": false,
   "content_type": "walking",
   "is_advertisement": false,
   "is_intro_highlights": false,
@@ -1218,6 +1426,11 @@ class Cosmos3VisualJudge:
         self.maximum_width = settings.COSMOS3_VIDEO_WIDTH
         log(f"Loading Cosmos 3 Reasoner: {model_name}")
         self.processor = AutoProcessor.from_pretrained(model_name)
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is not None and settings.COSMOS3_BATCH_SIZE > 1:
+            tokenizer.padding_side = "left"
+            if getattr(tokenizer, "pad_token_id", None) is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
         def load_cosmos_reasoner(
             checkpoint: str,
@@ -1332,6 +1545,87 @@ class Cosmos3VisualJudge:
                 str(exc),
             )
 
+        return self._finish_cut_verification(
+            sample_path,
+            cut_time,
+            clip_start_time,
+            boundary_time_in_clip,
+            answer,
+        )
+
+    def verify_cuts_batch(
+        self,
+        jobs: List[CutReviewJob],
+    ) -> List[CutVerification]:
+        """Verify several independent cut clips in one Cosmos generation."""
+        if len(jobs) <= 1:
+            return [
+                self.verify_cut(
+                    job.sample_path,
+                    job.cut_time,
+                    job.clip_start_time,
+                    job.boundary_time_in_clip,
+                )
+                for job in jobs
+            ]
+
+        message_batches = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "path": str(job.sample_path)},
+                        {
+                            "type": "text",
+                            "text": InternVLVisualJudge._build_cut_prompt(
+                                job.boundary_time_in_clip
+                            ),
+                        },
+                    ],
+                }
+            ]
+            for job in jobs
+        ]
+        try:
+            answers = self._generate_batch(
+                message_batches,
+                fps=settings.COSMOS3_CUT_FPS,
+            )
+        except Exception as exc:
+            log(
+                "Cosmos 3 cut batch failed after single item fallback: "
+                f"{exc}"
+            )
+            return [
+                InternVLVisualJudge._cut_error(
+                    job.cut_time,
+                    job.clip_start_time,
+                    job.boundary_time_in_clip,
+                    "model_error",
+                    str(exc),
+                )
+                for job in jobs
+            ]
+
+        return [
+            self._finish_cut_verification(
+                job.sample_path,
+                job.cut_time,
+                job.clip_start_time,
+                job.boundary_time_in_clip,
+                answer,
+            )
+            for job, answer in zip(jobs, answers)
+        ]
+
+    def _finish_cut_verification(
+        self,
+        sample_path: Path,
+        cut_time: float,
+        clip_start_time: float,
+        boundary_time_in_clip: float,
+        answer: str,
+    ) -> CutVerification:
         data = recover_json(answer)
         if (
             data is None
@@ -1521,6 +1815,99 @@ class Cosmos3VisualJudge:
                 str(exc),
             )
 
+        return self._finish_segment_review(
+            sample_path,
+            segment_prompt,
+            segment_index,
+            start_time,
+            end_time,
+            answer,
+        )
+
+    def judge_segments_batch(
+        self,
+        jobs: List[SegmentReviewJob],
+    ) -> List[SegmentReview]:
+        """Review several independent segment clips in one GPU batch."""
+        if len(jobs) <= 1:
+            return [
+                self.judge_segment(
+                    job.sample_path,
+                    job.metadata,
+                    job.segment_index,
+                    job.segment_count,
+                    job.start_time,
+                    job.end_time,
+                    job.video_duration,
+                )
+                for job in jobs
+            ]
+
+        prompts = [
+            self._build_segment_prompt(
+                job.metadata,
+                job.segment_index,
+                job.segment_count,
+                job.start_time,
+                job.end_time,
+                job.video_duration,
+            )
+            for job in jobs
+        ]
+        message_batches = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "path": str(job.sample_path)},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            for job, prompt in zip(jobs, prompts)
+        ]
+        try:
+            answers = self._generate_batch(
+                message_batches,
+                fps=settings.COSMOS3_REVIEW_FPS,
+            )
+        except Exception as exc:
+            log(
+                "Cosmos 3 segment batch failed after single item fallback: "
+                f"{exc}"
+            )
+            return [
+                InternVLVisualJudge._segment_error(
+                    job.segment_index,
+                    job.start_time,
+                    job.end_time,
+                    "model_error",
+                    str(exc),
+                )
+                for job in jobs
+            ]
+
+        return [
+            self._finish_segment_review(
+                job.sample_path,
+                prompt,
+                job.segment_index,
+                job.start_time,
+                job.end_time,
+                answer,
+            )
+            for job, prompt, answer in zip(jobs, prompts, answers)
+        ]
+
+    def _finish_segment_review(
+        self,
+        sample_path: Path,
+        segment_prompt: str,
+        segment_index: int,
+        start_time: int,
+        end_time: int,
+        answer: str,
+    ) -> SegmentReview:
         data = recover_json(answer)
         burst_content = self._normalise_burst_content(
             data.get("burst_content") if data else None
@@ -1607,10 +1994,12 @@ class Cosmos3VisualJudge:
             for label in _BURST_CONTENT_TYPES
         }
         walking_count = counts["walking"]
+        drone_aerial_count = counts["drone_aerial"]
         vehicle_count = counts["vehicle"]
         promotion_count = counts["promotion"]
         intro_count = counts["highlight"] + counts["map_title"]
         walking_fraction = walking_count / len(burst_content)
+        drone_aerial_fraction = drone_aerial_count / len(burst_content)
         promotion_fraction = promotion_count / len(burst_content)
         is_intro_highlights = intro_count > len(burst_content) / 2
         is_advertisement = (
@@ -1625,6 +2014,7 @@ class Cosmos3VisualJudge:
         is_walking = (
             walking_count >= required_walking_bursts
             and vehicle_count == 0
+            and drone_aerial_count == 0
         )
         walking_environment = normalise_walking_environment(
             data.get("walking_environment"),
@@ -1643,6 +2033,8 @@ class Cosmos3VisualJudge:
 
         if include:
             content_type = "walking"
+        elif drone_aerial_count:
+            content_type = "drone_aerial"
         elif is_intro_highlights:
             content_type = "intro_highlights"
         elif is_advertisement:
@@ -1670,6 +2062,7 @@ class Cosmos3VisualJudge:
             raw_response=answer,
             walking_fraction=round(walking_fraction, 4),
             promotion_fraction=round(promotion_fraction, 4),
+            drone_aerial_fraction=round(drone_aerial_fraction, 4),
             decision_method="fixed_budget_burst_recall",
             burst_content=burst_content,
             walking_environment=walking_environment,
@@ -1705,6 +2098,68 @@ class Cosmos3VisualJudge:
             clean_up_tokenization_spaces=False,
         )
         return decoded[0] if decoded else ""
+
+    def _generate_batch(
+        self,
+        message_batches: List[List[Dict[str, Any]]],
+        *,
+        fps: float,
+    ) -> List[str]:
+        if len(message_batches) <= 1:
+            return [
+                self._generate(messages, fps=fps)
+                for messages in message_batches
+            ]
+
+        try:
+            return self._generate_batch_once(message_batches, fps=fps)
+        except Exception as exc:
+            log(
+                f"Cosmos 3 could not process a batch of "
+                f"{len(message_batches)} clips ({exc}); falling back to "
+                "single clip generation"
+            )
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return [
+                self._generate(messages, fps=fps)
+                for messages in message_batches
+            ]
+
+    def _generate_batch_once(
+        self,
+        message_batches: List[List[Dict[str, Any]]],
+        *,
+        fps: float,
+    ) -> List[str]:
+        inputs = self.processor.apply_chat_template(
+            message_batches,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
+            processor_kwargs={"fps": fps},
+        ).to(self.model.device, torch.bfloat16)
+        with torch.inference_mode():
+            generated = self.model.generate(
+                **inputs,
+                max_new_tokens=settings.COSMOS3_MAX_NEW_TOKENS,
+                do_sample=False,
+            )
+        prompt_length = inputs["input_ids"].shape[1]
+        generated_ids = generated[:, prompt_length:]
+        decoded = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if len(decoded) != len(message_batches):
+            raise RuntimeError(
+                "Cosmos 3 returned a different number of answers than clips"
+            )
+        return list(decoded)
 
     @staticmethod
     def _optional_timestamp(value: Any, upper_bound: float) -> Optional[float]:
@@ -1786,8 +2241,9 @@ The review clip contains {expected_burst_count} short continuous motion bursts
 distributed chronologically across the whole source window. Motion inside each
 burst is real source motion and shows whether the camera is moving through the
 location. The jumps between bursts are sampling artefacts, not source cuts or
-a montage. Never reject the entire window because of one burst or a short
-portion.
+a montage. A single vehicle or drone_aerial burst is a hard exclusion for the
+whole window. Otherwise, do not reject the entire window because of one burst
+or a short portion.
 
 Valid walking includes first person walking indoors or outdoors, walking
 through shops, markets, malls, stations, parks, gardens, forests, temples,
@@ -1806,21 +2262,30 @@ chronological order, using exactly one of these labels:
 
 walking: the camera wearer is moving on foot through a real location, indoors
 or outdoors, or is briefly paused during an otherwise pedestrian continuation
-vehicle: driving, riding, cycling, boat, train, bus, drone, or other transport
-static: a genuinely fixed tripod, aerial, scenic, or staged viewpoint with no
-pedestrian progression; do not use static merely because motion is slow,
-stabilised, or interrupted by a short pause
+drone_aerial: drone, aircraft, elevated flyover, floating aerial view, or
+camera movement above roofs, streets, water, or scenery that is impossible for
+a person walking at ground level
+vehicle: driving, riding, cycling, boat, train, bus, or other ground or water
+transport
+static: a genuinely fixed tripod, scenic, or staged viewpoint with no
+pedestrian progression; do not use static for aerial footage and do not use it
+merely because motion is slow, stabilised, or interrupted by a short pause
 highlight: an opening preview, montage, recap, or teaser
 map_title: a map, route graphic, logo, title card, or similar screen
 promotion: inserted sponsor or channel promotion unrelated to the surroundings
 other: game, animation, slideshow, screen recording, or unclear content
 
 Compare the frames inside each burst for changes in nearby geometry, parallax,
-footstep sway, and forward progression. A head height first person view along
-a street, path, market, shop, bridge, or waterfront should be walking when
-those changes show pedestrian movement. One genuine walking burst is enough
-for the whole window when the remaining bursts are only static pauses. Never
-apply this exception when any burst is vehicle content.
+footstep sway, camera height, the visible walking surface, and forward
+progression. A head height first person view along a street, path, market,
+shop, bridge, or waterfront should be walking when those changes show
+pedestrian movement. Smooth stabilised flight or gliding over roofs, buildings,
+streets, rivers, coastlines, or other scenery is drone_aerial, not walking.
+Panning, tilting, or zooming from an elevated scenic viewpoint is also not
+walking. Do not infer indoor walking merely because the view appears to be
+through or beside windows. One genuine walking burst is enough for the whole
+window when the remaining bursts are only static pauses. Never apply this
+exception when any burst is vehicle or drone_aerial content.
 
 Standing temporarily and rotating or panning the camera to look around during
 an ongoing first person pedestrian tour is valid walking context. Label that
@@ -1829,8 +2294,10 @@ burst does not invalidate a long window when another burst clearly shows real
 walking, but a highlight reel or map dominated window must still be rejected.
 
 Do not call road motion or scenic travel walking when the camera is moving in
-or on a vehicle. Classify time of day as day, night, dawn_dusk, or unknown.
-Indoor or ambiguous footage is unknown.
+or on a vehicle, drone, or aircraft. Any drone_aerial label means the entire
+window must be rejected, even when another burst is labelled walking. Classify
+time of day as day, night, dawn_dusk, or unknown. Indoor or ambiguous footage
+is unknown.
 
 For genuine walking, classify the dominant walking_environment as exactly one
 of street, indoor, beach, park_nature, trail, market, waterfront,
@@ -1877,41 +2344,136 @@ def verify_cut_candidates(
         prefix=f"walk_cuts_{video_id}_"
     ) as temporary_name:
         temporary_dir = Path(temporary_name)
-        for cut_index, cut_time in enumerate(cut_times):
-            clip_start, clip_duration, boundary_offset = (
-                cut_verification_window(cut_time, duration)
-            )
-            sample_path = temporary_dir / f"cut_{cut_index:04d}.mp4"
-            if not create_sample_clip(
-                video_path,
-                clip_start,
-                sample_path,
-                clip_duration,
-            ):
-                verification = InternVLVisualJudge._cut_error(
-                    cut_time,
-                    clip_start,
-                    boundary_offset,
-                    "clip_creation_failed",
-                    "FFmpeg could not create the cut verification clip.",
+        prepared: List[
+            tuple[int, float, float, float, Path, Future[bool]]
+        ] = []
+        with ThreadPoolExecutor(
+            max_workers=settings.CLIP_PREPARE_WORKERS,
+            thread_name_prefix="walk_cut_clip",
+        ) as clip_executor:
+            for cut_index, cut_time in enumerate(cut_times):
+                clip_start, clip_duration, boundary_offset = (
+                    cut_verification_window(cut_time, duration)
                 )
-            else:
-                verification = judge.verify_cut(
+                sample_path = temporary_dir / f"cut_{cut_index:04d}.mp4"
+                future = clip_executor.submit(
+                    create_sample_clip,
+                    video_path,
+                    clip_start,
                     sample_path,
+                    clip_duration,
+                )
+                prepared.append(
+                    (
+                        cut_index,
+                        cut_time,
+                        clip_start,
+                        boundary_offset,
+                        sample_path,
+                        future,
+                    )
+                )
+
+            batch_size = (
+                settings.COSMOS3_BATCH_SIZE
+                if hasattr(judge, "verify_cuts_batch")
+                else 1
+            )
+            if len(prepared) > 1:
+                log(
+                    f"Preparing cut clips with "
+                    f"{settings.CLIP_PREPARE_WORKERS} worker(s); "
+                    f"Cosmos batch size={batch_size}"
+                )
+
+            for batch_start in range(0, len(prepared), batch_size):
+                batch_entries = prepared[
+                    batch_start : batch_start + batch_size
+                ]
+                batch_jobs: List[CutReviewJob] = []
+                batch_job_indices: List[int] = []
+                batch_results: Dict[int, CutVerification] = {}
+                for (
+                    cut_index,
                     cut_time,
                     clip_start,
                     boundary_offset,
-                )
-            verifications.append(verification)
-            log(
-                f"{video_id} cut {cut_index}: "
-                f"time={cut_time:.2f}, real={verification.is_real_cut}, "
-                f"confidence={verification.confidence:.2f}, "
-                f"evidence={verification.boundary_evidence}"
-            )
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                    sample_path,
+                    future,
+                ) in batch_entries:
+                    try:
+                        clip_ready = future.result()
+                    except Exception as exc:
+                        clip_ready = False
+                        log(
+                            f"Cut clip preparation failed at "
+                            f"{cut_time:.2f}s: {exc}"
+                        )
+                    if not clip_ready:
+                        batch_results[cut_index] = (
+                            InternVLVisualJudge._cut_error(
+                                cut_time,
+                                clip_start,
+                                boundary_offset,
+                                "clip_creation_failed",
+                                (
+                                    "FFmpeg could not create the cut "
+                                    "verification clip."
+                                ),
+                            )
+                        )
+                        continue
+                    batch_job_indices.append(cut_index)
+                    batch_jobs.append(
+                        CutReviewJob(
+                            sample_path=sample_path,
+                            cut_time=cut_time,
+                            clip_start_time=clip_start,
+                            boundary_time_in_clip=boundary_offset,
+                        )
+                    )
+
+                if batch_jobs:
+                    if len(batch_jobs) > 1 and hasattr(
+                        judge, "verify_cuts_batch"
+                    ):
+                        reviewed_batch = judge.verify_cuts_batch(batch_jobs)
+                    else:
+                        reviewed_batch = [
+                            judge.verify_cut(
+                                job.sample_path,
+                                job.cut_time,
+                                job.clip_start_time,
+                                job.boundary_time_in_clip,
+                            )
+                            for job in batch_jobs
+                        ]
+                    for cut_index, verification in zip(
+                        batch_job_indices,
+                        reviewed_batch,
+                    ):
+                        batch_results[cut_index] = verification
+
+                for (
+                    cut_index,
+                    cut_time,
+                    _clip_start,
+                    _boundary_offset,
+                    _sample_path,
+                    _future,
+                ) in batch_entries:
+                    verification = batch_results[cut_index]
+                    verifications.append(verification)
+                    log(
+                        f"{video_id} cut {cut_index}: "
+                        f"time={cut_time:.2f}, "
+                        f"real={verification.is_real_cut}, "
+                        f"confidence={verification.confidence:.2f}, "
+                        f"evidence={verification.boundary_evidence}"
+                    )
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
     return verifications
 
 
@@ -1936,7 +2498,6 @@ def review_segments(
     judge: Any,
     prior_reviews: Optional[List[Dict[str, Any]]] = None,
 ) -> List[SegmentReview]:
-    reviews: List[SegmentReview] = []
     segment_count = len(segments)
     reusable_reviews: Dict[tuple[int, int, int], SegmentReview] = {}
     allowed_fields = set(SegmentReview.__dataclass_fields__)
@@ -1970,130 +2531,246 @@ def review_segments(
         prefix=f"walk_segments_{video_id}_"
     ) as temporary_name:
         temporary_dir = Path(temporary_name)
-        for segment_index, segment in enumerate(segments):
-            start_time = int(segment["start_time"])
-            end_time = int(segment["end_time"])
-            timestamp_labels = timestamp_labels_for_segment(
-                metadata,
-                start_time,
-                end_time,
-            )
-            sample_path = temporary_dir / f"segment_{segment_index:04d}.mp4"
-            segment_duration = segment_duration_seconds(segment)
-            forced_rejection = segment.get("_forced_rejection")
-            cache_key = (segment_index, start_time, end_time)
-            if cache_key in reusable_reviews:
-                review = reusable_reviews[cache_key]
-            elif isinstance(forced_rejection, dict):
-                review = SegmentReview(
-                    segment_index=segment_index,
-                    start_time=start_time,
-                    end_time=end_time,
-                    include=False,
-                    confidence=clamp_float(
-                        forced_rejection.get("confidence"),
-                        0.0,
-                        1.0,
-                    ),
-                    is_walking_video=False,
-                    content_type=clean_text(
-                        forced_rejection.get("content_type")
-                        or "intro_highlights"
-                    ),
-                    is_advertisement=False,
-                    is_intro_highlights=True,
-                    time_of_day="unknown",
-                    quality_issues=[
-                        clean_text(
-                            forced_rejection.get("quality_issue")
-                            or "intro_before_main_content"
-                        )
-                    ],
-                    short_reason=clean_text(
-                        forced_rejection.get("short_reason")
-                        or "This footage precedes the main walking tour."
-                    ),
-                    raw_response=clean_text(
-                        forced_rejection.get("raw_response")
-                    ),
-                    decision_method="semantic_content_start",
-                    walking_environment="not_applicable",
-                    error=None,
+        reviews_by_index: Dict[int, SegmentReview] = {}
+        timestamp_labels_by_index: Dict[int, List[Dict[str, Any]]] = {}
+        prepared: List[
+            tuple[int, int, int, Path, Future[bool]]
+        ] = []
+
+        with ThreadPoolExecutor(
+            max_workers=settings.CLIP_PREPARE_WORKERS,
+            thread_name_prefix="walk_segment_clip",
+        ) as clip_executor:
+            for segment_index, segment in enumerate(segments):
+                start_time = int(segment["start_time"])
+                end_time = int(segment["end_time"])
+                timestamp_labels_by_index[segment_index] = (
+                    timestamp_labels_for_segment(
+                        metadata,
+                        start_time,
+                        end_time,
+                    )
                 )
-            elif segment_duration < settings.MIN_SEGMENT_DURATION_SECONDS:
-                review = SegmentReview(
-                    segment_index=segment_index,
-                    start_time=start_time,
-                    end_time=end_time,
-                    include=False,
-                    confidence=1.0,
-                    is_walking_video=False,
-                    content_type="unclear",
-                    is_advertisement=False,
-                    is_intro_highlights=False,
-                    time_of_day="unknown",
-                    quality_issues=["segment_too_short"],
-                    short_reason=(
-                        f"The segment is {segment_duration} seconds long, "
-                        "which is below the configured minimum of "
-                        f"{settings.MIN_SEGMENT_DURATION_SECONDS} seconds."
-                    ),
-                    raw_response="",
-                    walking_environment="not_applicable",
-                    error=None,
+                segment_duration = segment_duration_seconds(segment)
+                forced_rejection = segment.get("_forced_rejection")
+                cache_key = (segment_index, start_time, end_time)
+
+                if cache_key in reusable_reviews:
+                    reviews_by_index[segment_index] = (
+                        reusable_reviews[cache_key]
+                    )
+                    continue
+                if isinstance(forced_rejection, dict):
+                    reviews_by_index[segment_index] = SegmentReview(
+                        segment_index=segment_index,
+                        start_time=start_time,
+                        end_time=end_time,
+                        include=False,
+                        confidence=clamp_float(
+                            forced_rejection.get("confidence"),
+                            0.0,
+                            1.0,
+                        ),
+                        is_walking_video=False,
+                        content_type=clean_text(
+                            forced_rejection.get("content_type")
+                            or "intro_highlights"
+                        ),
+                        is_advertisement=False,
+                        is_intro_highlights=True,
+                        time_of_day="unknown",
+                        quality_issues=[
+                            clean_text(
+                                forced_rejection.get("quality_issue")
+                                or "intro_before_main_content"
+                            )
+                        ],
+                        short_reason=clean_text(
+                            forced_rejection.get("short_reason")
+                            or "This footage precedes the main walking tour."
+                        ),
+                        raw_response=clean_text(
+                            forced_rejection.get("raw_response")
+                        ),
+                        decision_method="semantic_content_start",
+                        walking_environment="not_applicable",
+                        error=None,
+                    )
+                    continue
+                if segment_duration < settings.MIN_SEGMENT_DURATION_SECONDS:
+                    reviews_by_index[segment_index] = SegmentReview(
+                        segment_index=segment_index,
+                        start_time=start_time,
+                        end_time=end_time,
+                        include=False,
+                        confidence=1.0,
+                        is_walking_video=False,
+                        content_type="unclear",
+                        is_advertisement=False,
+                        is_intro_highlights=False,
+                        time_of_day="unknown",
+                        quality_issues=["segment_too_short"],
+                        short_reason=(
+                            f"The segment is {segment_duration} seconds long, "
+                            "which is below the configured minimum of "
+                            f"{settings.MIN_SEGMENT_DURATION_SECONDS} seconds."
+                        ),
+                        raw_response="",
+                        walking_environment="not_applicable",
+                        error=None,
+                    )
+                    continue
+
+                sample_path = (
+                    temporary_dir / f"segment_{segment_index:04d}.mp4"
                 )
-            elif not create_segment_review_clip(
-                video_path,
-                start_time,
-                end_time,
-                sample_path,
-                target_frame_count=getattr(
-                    judge,
-                    "frames_per_sample",
-                    settings.FRAMES_PER_SAMPLE,
-                ),
-                maximum_width=getattr(judge, "maximum_width", 480),
-            ):
-                review = InternVLVisualJudge._segment_error(
-                    segment_index,
+                future = clip_executor.submit(
+                    create_segment_review_clip,
+                    video_path,
                     start_time,
                     end_time,
-                    "clip_creation_failed",
-                    "FFmpeg could not create the segment review clip.",
-                )
-            else:
-                review = judge.judge_segment(
                     sample_path,
-                    metadata,
+                    target_frame_count=getattr(
+                        judge,
+                        "frames_per_sample",
+                        settings.FRAMES_PER_SAMPLE,
+                    ),
+                    maximum_width=getattr(judge, "maximum_width", 480),
+                )
+                prepared.append(
+                    (
+                        segment_index,
+                        start_time,
+                        end_time,
+                        sample_path,
+                        future,
+                    )
+                )
+
+            batch_size = (
+                settings.COSMOS3_BATCH_SIZE
+                if hasattr(judge, "judge_segments_batch")
+                else 1
+            )
+            if prepared:
+                log(
+                    f"Preparing segment clips with "
+                    f"{settings.CLIP_PREPARE_WORKERS} worker(s); "
+                    f"Cosmos batch size={batch_size}"
+                )
+
+            stop_after_index: Optional[int] = None
+            for batch_start in range(0, len(prepared), batch_size):
+                batch_entries = prepared[
+                    batch_start : batch_start + batch_size
+                ]
+                batch_jobs: List[SegmentReviewJob] = []
+                batch_job_indices: List[int] = []
+
+                for (
                     segment_index,
-                    segment_count,
                     start_time,
                     end_time,
-                    duration,
-                )
-            review.timestamp_labels = timestamp_labels
-            review.location_source = segment_location_source(
-                review.timestamp_labels,
-                review.embedded_location_text,
-            )
-            reviews.append(review)
+                    sample_path,
+                    future,
+                ) in batch_entries:
+                    try:
+                        clip_ready = future.result()
+                    except Exception as exc:
+                        clip_ready = False
+                        log(
+                            f"Segment {segment_index} clip preparation "
+                            f"failed: {exc}"
+                        )
+                    if not clip_ready:
+                        reviews_by_index[segment_index] = (
+                            InternVLVisualJudge._segment_error(
+                                segment_index,
+                                start_time,
+                                end_time,
+                                "clip_creation_failed",
+                                (
+                                    "FFmpeg could not create the segment "
+                                    "review clip."
+                                ),
+                            )
+                        )
+                        if stop_after_index is None:
+                            stop_after_index = segment_index
+                        continue
+                    batch_job_indices.append(segment_index)
+                    batch_jobs.append(
+                        SegmentReviewJob(
+                            sample_path=sample_path,
+                            metadata=metadata,
+                            segment_index=segment_index,
+                            segment_count=segment_count,
+                            start_time=start_time,
+                            end_time=end_time,
+                            video_duration=duration,
+                        )
+                    )
+
+                if batch_jobs:
+                    if len(batch_jobs) > 1 and hasattr(
+                        judge, "judge_segments_batch"
+                    ):
+                        reviewed_batch = judge.judge_segments_batch(batch_jobs)
+                    else:
+                        reviewed_batch = [
+                            judge.judge_segment(
+                                job.sample_path,
+                                job.metadata,
+                                job.segment_index,
+                                job.segment_count,
+                                job.start_time,
+                                job.end_time,
+                                job.video_duration,
+                            )
+                            for job in batch_jobs
+                        ]
+                    for segment_index, review in zip(
+                        batch_job_indices,
+                        reviewed_batch,
+                    ):
+                        reviews_by_index[segment_index] = review
+                        if review.error is not None and (
+                            stop_after_index is None
+                            or segment_index < stop_after_index
+                        ):
+                            stop_after_index = segment_index
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if stop_after_index is not None:
+                    break
+
+    reviews: List[SegmentReview] = []
+    for segment_index in range(segment_count):
+        review = reviews_by_index.get(segment_index)
+        if review is None:
+            break
+        review.timestamp_labels = timestamp_labels_by_index[segment_index]
+        review.location_source = segment_location_source(
+            review.timestamp_labels,
+            review.embedded_location_text,
+        )
+        reviews.append(review)
+        log(
+            f"{video_id} segment {segment_index}: "
+            f"include={review.include}, type={review.content_type}, "
+            f"confidence={review.confidence:.2f}, "
+            f"time={review.time_of_day}, "
+            f"environment={review.walking_environment}, "
+            f"location_source={review.location_source}"
+        )
+        if review.error is not None:
             log(
-                f"{video_id} segment {segment_index}: "
-                f"include={review.include}, type={review.content_type}, "
-                f"confidence={review.confidence:.2f}, "
-                f"time={review.time_of_day}, "
-                f"environment={review.walking_environment}, "
-                f"location_source={review.location_source}"
+                f"Stopping segment review for {video_id} after "
+                f"segment {segment_index} failed: {review.error}"
             )
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            if review.error is not None:
-                log(
-                    f"Stopping segment review for {video_id} after "
-                    f"segment {segment_index} failed: {review.error}"
-                )
-                break
+            break
     return reviews
 
 
@@ -2595,7 +3272,7 @@ def _finalise_analysed_video_file(
         record["video_file_kept"] = False
         return
 
-    if settings.KEEP_VIDEO_FILES_AFTER_ANALYSIS:
+    if not settings.DELETE_VIDEO_AFTER_PROCESSING:
         record["video_file_kept"] = video_path.exists()
         return
 
@@ -2621,7 +3298,7 @@ def process_visual_candidate(
     judge: Any,
     video_path: Optional[Path] = None,
 ) -> None:
-    """Analyse one video and apply the configured file retention policy."""
+    """Analyse one video and apply the configured deletion policy."""
     record["status"] = "visual_processing"
     try:
         _process_visual_candidate(video_id, record, judge, video_path)
@@ -2632,40 +3309,102 @@ def process_visual_candidate(
 DownloadQueueItem = Tuple[
     str,
     Dict[str, Any],
-    Optional[Path],
-    Optional[str],
+    Path,
+]
+
+DownloadFailureItem = Tuple[
+    str,
+    Dict[str, Any],
+    str,
 ]
 
 
 def _fill_download_queue(
     pending: List[Tuple[str, Dict[str, Any]]],
     ready_queue: "queue.Queue[DownloadQueueItem]",
+    failed_queue: "queue.Queue[DownloadFailureItem]",
     stop_event: threading.Event,
     producer_finished: threading.Event,
+    success_target: int,
+    attempt_limit: int,
+    stats: DownloadProducerStats,
 ) -> None:
+    consecutive_failures = 0
     try:
         for video_id, record in pending:
             if stop_event.is_set():
+                stats.stop_reason = "visual stage finished"
+                break
+            if stats.successes >= success_target:
+                stats.stop_reason = "download success target reached"
+                break
+            if stats.attempts >= attempt_limit:
+                stats.stop_reason = "download attempt limit reached"
                 break
 
-            video_path: Optional[Path] = None
-            download_error: Optional[str] = None
+            stats.attempts += 1
+            download_result: VideoDownloadResult
             try:
                 log(f"Prefetching accepted metadata candidate {video_id}")
-                video_path = download_video(video_id)
-                if video_path is None:
-                    download_error = "yt-dlp could not download the video"
+                download_result = download_video_with_result(video_id)
             except Exception as exc:
-                download_error = str(exc)
+                download_result = VideoDownloadResult(
+                    path=None,
+                    error=str(exc),
+                )
                 log(f"Video prefetch failed for {video_id}: {exc}")
 
-            item = (video_id, record, video_path, download_error)
+            if download_result.path is None:
+                stats.failures += 1
+                consecutive_failures += 1
+                failed_queue.put(
+                    (
+                        video_id,
+                        record,
+                        download_result.error
+                        or "yt-dlp could not download the video",
+                    )
+                )
+
+                if (
+                    download_result.authentication_error
+                    and settings.VIDEO_DOWNLOAD_STOP_ON_AUTH_ERROR
+                ):
+                    stats.stop_reason = (
+                        "YouTube authentication block detected"
+                    )
+                    log(
+                        "Stopping video prefetch after YouTube rejected "
+                        "the authenticated session. Existing downloaded "
+                        "videos will still be analysed."
+                    )
+                    break
+
+                if (
+                    consecutive_failures
+                    >= settings.VIDEO_DOWNLOAD_MAX_CONSECUTIVE_FAILURES
+                ):
+                    stats.stop_reason = (
+                        "maximum consecutive download failures reached"
+                    )
+                    log(
+                        "Stopping video prefetch after "
+                        f"{consecutive_failures} consecutive failures"
+                    )
+                    break
+                continue
+
+            consecutive_failures = 0
+            stats.successes += 1
+            item = (video_id, record, download_result.path)
             while not stop_event.is_set():
                 try:
                     ready_queue.put(item, timeout=0.25)
                     break
                 except queue.Full:
                     continue
+        else:
+            stats.stop_reason = "no more pending videos"
     finally:
         producer_finished.set()
 
@@ -2673,16 +3412,13 @@ def _fill_download_queue(
 def _next_downloaded_video(
     ready_queue: "queue.Queue[DownloadQueueItem]",
     producer_finished: threading.Event,
-) -> DownloadQueueItem:
+) -> Optional[DownloadQueueItem]:
     while True:
         try:
             return ready_queue.get(timeout=0.50)
         except queue.Empty:
             if producer_finished.is_set():
-                raise RuntimeError(
-                    "The video download worker stopped before every pending "
-                    "video produced a result."
-                )
+                return None
 
 
 def _wait_for_initial_download_buffer(
@@ -2696,8 +3432,31 @@ def _wait_for_initial_download_buffer(
 
     log(
         f"Initial download queue ready: {ready_queue.qsize()}/{target} "
-        "video(s)"
+        "successfully downloaded video(s)"
     )
+
+
+def _apply_download_failures(
+    state: Dict[str, Any],
+    failed_queue: "queue.Queue[DownloadFailureItem]",
+    after_video: Optional[Callable[[Dict[str, Any]], None]],
+) -> int:
+    handled = 0
+    while True:
+        try:
+            video_id, record, download_error = failed_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        record["visual_review_version"] = settings.VISUAL_REVIEW_VERSION
+        record["status"] = "download_failed"
+        record["error"] = download_error
+        log(f"Download failed for {video_id}: {download_error}")
+        save_state(state)
+        if after_video:
+            after_video(state)
+        handled += 1
+    return handled
 
 
 def run_visual_stage(
@@ -2719,10 +3478,13 @@ def run_visual_stage(
             continue
         pending.append((video_id, record))
 
-    if settings.MAX_VIDEOS_PER_RUN is not None:
-        pending = pending[: settings.MAX_VIDEOS_PER_RUN]
     if not pending:
         return 0
+
+    visual_budget = min(
+        settings.MAX_VIDEOS_PER_RUN or len(pending),
+        len(pending),
+    )
 
     # One extra slot ensures that, while one video is being analysed, the
     # configured number can remain downloaded and waiting whenever enough
@@ -2731,11 +3493,31 @@ def run_visual_stage(
     ready_queue: "queue.Queue[DownloadQueueItem]" = queue.Queue(
         maxsize=queue_capacity
     )
+    failed_queue: "queue.Queue[DownloadFailureItem]" = queue.Queue()
     stop_event = threading.Event()
     producer_finished = threading.Event()
+    success_target = min(
+        len(pending),
+        visual_budget + settings.VIDEO_DOWNLOAD_QUEUE_SIZE,
+    )
+    attempt_limit = min(
+        len(pending),
+        success_target
+        + settings.VIDEO_DOWNLOAD_FAILURE_ALLOWANCE_PER_RUN,
+    )
+    producer_stats = DownloadProducerStats()
     producer = threading.Thread(
         target=_fill_download_queue,
-        args=(pending, ready_queue, stop_event, producer_finished),
+        args=(
+            pending,
+            ready_queue,
+            failed_queue,
+            stop_event,
+            producer_finished,
+            success_target,
+            attempt_limit,
+            producer_stats,
+        ),
         name="walking-video-prefetch",
         daemon=True,
     )
@@ -2744,46 +3526,50 @@ def run_visual_stage(
     log(
         "Video download queue target: "
         f"{settings.VIDEO_DOWNLOAD_QUEUE_SIZE} waiting video(s); "
-        "keep analysed files="
-        f"{settings.KEEP_VIDEO_FILES_AFTER_ANALYSIS}"
+        f"success target={success_target}; "
+        f"attempt limit={attempt_limit}; "
+        "delete processed videos="
+        f"{settings.DELETE_VIDEO_AFTER_PROCESSING}"
     )
 
     judge: Any = None
     processed = 0
+    download_failures = 0
     try:
         judge = create_visual_judge()
-        initial_target = min(queue_capacity, len(pending))
+        initial_target = min(queue_capacity, visual_budget, len(pending))
         _wait_for_initial_download_buffer(
             ready_queue,
             producer_finished,
             initial_target,
         )
 
-        for _ in pending:
-            (
-                video_id,
-                record,
-                video_path,
-                download_error,
-            ) = _next_downloaded_video(ready_queue, producer_finished)
+        while processed < visual_budget:
+            download_failures += _apply_download_failures(
+                state,
+                failed_queue,
+                after_video,
+            )
+            item = _next_downloaded_video(
+                ready_queue,
+                producer_finished,
+            )
+            if item is None:
+                download_failures += _apply_download_failures(
+                    state,
+                    failed_queue,
+                    after_video,
+                )
+                break
+
+            video_id, record, video_path = item
             try:
-                if video_path is None:
-                    record["visual_review_version"] = (
-                        settings.VISUAL_REVIEW_VERSION
-                    )
-                    record["status"] = "download_failed"
-                    record["error"] = (
-                        download_error
-                        or "yt-dlp could not download the video"
-                    )
-                    log(f"Download failed for {video_id}: {record['error']}")
-                else:
-                    process_visual_candidate(
-                        video_id,
-                        record,
-                        judge,
-                        video_path,
-                    )
+                process_visual_candidate(
+                    video_id,
+                    record,
+                    judge,
+                    video_path,
+                )
             except KeyboardInterrupt:
                 save_state(state)
                 raise
@@ -2799,6 +3585,19 @@ def run_visual_stage(
     finally:
         stop_event.set()
         producer.join(timeout=1.0)
+        download_failures += _apply_download_failures(
+            state,
+            failed_queue,
+            after_video,
+        )
         if judge is not None:
             unload_model(judge)
+    log(
+        f"Visual download summary: analysed={processed}, "
+        f"download_failed={download_failures}, "
+        f"ready_for_next_run={ready_queue.qsize()}, "
+        f"download_attempts={producer_stats.attempts}, "
+        f"download_successes={producer_stats.successes}, "
+        f"prefetch_stop={producer_stats.stop_reason or 'not reported'}"
+    )
     return processed

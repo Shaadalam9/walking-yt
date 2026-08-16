@@ -7,10 +7,23 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 from . import settings
-from .shared import require_binary, run_command
+from .shared import log, require_binary, run_command
+
+
+CUT_DETECTION_SCHEMA_VERSION = "walking_ffmpeg_cuda_v1"
+
+_HIGH_BIT_DEPTH_PIXEL_FORMAT_HINTS = (
+    "10",
+    "12",
+    "14",
+    "16",
+    "p010",
+    "p012",
+    "p016",
+)
 
 
 @dataclass
@@ -20,6 +33,159 @@ class CutDetectionResult:
     message: str
 
 
+def _number_text(value: float) -> str:
+    """Return a compact locale independent FFmpeg numeric value."""
+    return format(float(value), ".8g")
+
+
+def _probe_source_pixel_format(video_path: Path) -> str:
+    """Return the first video stream pixel format when FFprobe can read it."""
+    try:
+        result = run_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=pix_fmt",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+    if result.returncode != 0:
+        return ""
+    for line in result.stdout.splitlines():
+        value = line.strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _cuda_download_formats(pixel_format: str) -> Tuple[str, str]:
+    """Order CUDA download formats using the encoded source bit depth."""
+    is_high_bit_depth = any(
+        hint in pixel_format
+        for hint in _HIGH_BIT_DEPTH_PIXEL_FORMAT_HINTS
+    )
+    if is_high_bit_depth:
+        return ("p010le", "nv12")
+    return ("nv12", "p010le")
+
+
+def _filter_graph(*, cuda_download_format: str | None) -> str:
+    fps = _number_text(settings.CUT_DETECTION_FPS)
+    width = settings.CUT_DETECTION_WIDTH
+
+    if cuda_download_format:
+        preprocessing = (
+            f"[0:v]scale_cuda={width}:-2,"
+            "hwdownload,"
+            f"format={cuda_download_format},"
+            "format=yuv420p,"
+            f"fps={fps},"
+        )
+    else:
+        preprocessing = (
+            f"[0:v]fps={fps},"
+            f"scale={width}:-2:flags=fast_bilinear,"
+            "format=yuv420p,"
+        )
+
+    return (
+        f"{preprocessing}setpts=PTS-STARTPTS,split=2"
+        "[scene_input][adaptive_input];"
+        "[scene_input]"
+        f"select='gt(scene,{settings.SCENE_THRESHOLD})',"
+        "showinfo[scene_output];"
+        "[adaptive_input]"
+        f"scdet=t={settings.SCDET_THRESHOLD}:s=1,"
+        "metadata=mode=print:key=lavfi.scd.time[adaptive_output]"
+    )
+
+
+def _ffmpeg_detection_command(
+    video_path: Path,
+    *,
+    cuda_download_format: str | None,
+) -> List[str]:
+    command = ["ffmpeg", "-hide_banner", "-nostdin"]
+    if cuda_download_format:
+        command.extend(
+            [
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+            ]
+        )
+    command.extend(
+        [
+            "-i",
+            str(video_path),
+            "-filter_complex",
+            _filter_graph(cuda_download_format=cuda_download_format),
+            "-map",
+            "[scene_output]",
+            "-map",
+            "[adaptive_output]",
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    return command
+
+
+def _result_error(result: subprocess.CompletedProcess[str]) -> str:
+    lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    return lines[-1] if lines else "ffmpeg_failed"
+
+
+def _extract_cut_times(stderr: str, duration: float) -> List[float]:
+    cut_times: List[float] = []
+    for line in stderr.splitlines():
+        values: List[str] = []
+        if "showinfo" in line:
+            match = re.search(
+                r"pts_time:([+-]?(?:\d+(?:\.\d*)?|\.\d+))",
+                line,
+            )
+            if match:
+                values.append(match.group(1))
+        adaptive_match = re.search(
+            r"lavfi\.scd\.time=([+-]?(?:\d+(?:\.\d*)?|\.\d+))",
+            line,
+        )
+        if adaptive_match:
+            values.append(adaptive_match.group(1))
+        for text_value in values:
+            value = float(text_value)
+            if math.isfinite(value):
+                cut_times.append(value)
+
+    filtered = filter_cut_edges(cut_times, duration)
+    return merge_nearby_times(filtered)
+
+
+def _completed_detection_result(
+    result: subprocess.CompletedProcess[str],
+    duration: float,
+) -> CutDetectionResult:
+    return CutDetectionResult(
+        _extract_cut_times(result.stderr, duration),
+        duration,
+        "",
+    )
+
+
 def run_ffmpeg_scene_detection(
     video_path: Path, duration: float
 ) -> CutDetectionResult:
@@ -27,50 +193,84 @@ def run_ffmpeg_scene_detection(
     if duration <= 0:
         return CutDetectionResult([], duration, "invalid_duration")
 
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostdin",
-        "-i",
-        str(video_path),
-        "-vf",
-        (
-            "setpts=PTS-STARTPTS,"
-            f"select='gt(scene,{settings.SCENE_THRESHOLD})',showinfo"
-        ),
-        "-an",
-        "-f",
-        "null",
-        "-",
-    ]
+    backend = settings.CUT_DETECTION_BACKEND
+    failure_messages: List[str] = []
+
+    if backend in {"auto", "ffmpeg_cuda"}:
+        pixel_format = _probe_source_pixel_format(video_path)
+        for download_format in _cuda_download_formats(pixel_format):
+            log(
+                "Running CUDA cut detection at "
+                f"{_number_text(settings.CUT_DETECTION_FPS)} FPS and "
+                f"width {settings.CUT_DETECTION_WIDTH}; "
+                f"download format={download_format}"
+            )
+            command = _ffmpeg_detection_command(
+                video_path,
+                cuda_download_format=download_format,
+            )
+            try:
+                result = run_command(
+                    command,
+                    timeout=settings.CUT_DETECTION_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                failure_messages.append("ffmpeg_cuda_timeout")
+                break
+
+            if result.returncode == 0:
+                log("CUDA cut detection completed successfully")
+                return _completed_detection_result(result, duration)
+
+            error = _result_error(result)
+            failure_messages.append(
+                f"ffmpeg_cuda_{download_format}: {error}"
+            )
+            format_error = (
+                "invalid output format" in result.stderr.lower()
+                or "failed to configure output pad"
+                in result.stderr.lower()
+            )
+            if not format_error:
+                break
+
+        if not settings.CUT_DETECTION_CPU_FALLBACK:
+            return CutDetectionResult(
+                [],
+                duration,
+                " | ".join(failure_messages) or "ffmpeg_cuda_failed",
+            )
+        log("CUDA cut detection failed; using the CPU fallback")
+
+    cpu_command = _ffmpeg_detection_command(
+        video_path,
+        cuda_download_format=None,
+    )
     try:
-        result = run_command(
-            command, timeout=settings.CUT_DETECTION_TIMEOUT
+        cpu_result = run_command(
+            cpu_command,
+            timeout=settings.CUT_DETECTION_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return CutDetectionResult([], duration, "ffmpeg_timeout")
-
-    if result.returncode != 0:
-        message = (
-            result.stderr.splitlines()[-1]
-            if result.stderr
-            else "ffmpeg_failed"
+        failure_messages.append("ffmpeg_cpu_timeout")
+        return CutDetectionResult(
+            [],
+            duration,
+            " | ".join(failure_messages),
         )
-        return CutDetectionResult([], duration, message)
 
-    cut_times: List[float] = []
-    for line in result.stderr.splitlines():
-        match = re.search(
-            r"pts_time:([+-]?(?:\d+(?:\.\d*)?|\.\d+))", line
-        )
-        if match:
-            value = float(match.group(1))
-            if math.isfinite(value):
-                cut_times.append(value)
+    if cpu_result.returncode == 0:
+        log("CPU cut detection completed successfully")
+        return _completed_detection_result(cpu_result, duration)
 
-    filtered = filter_cut_edges(cut_times, duration)
-    merged = merge_nearby_times(filtered)
-    return CutDetectionResult(merged, duration, "")
+    failure_messages.append(
+        f"ffmpeg_cpu: {_result_error(cpu_result)}"
+    )
+    return CutDetectionResult(
+        [],
+        duration,
+        " | ".join(failure_messages),
+    )
 
 
 def filter_cut_edges(

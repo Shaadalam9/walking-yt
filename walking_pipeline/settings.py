@@ -12,14 +12,19 @@ import os
 from pathlib import Path
 from typing import Any, List, Optional
 
-from common import get_configs
+from common import get_configs, root_dir
 
 
 _VALID_PIPELINE_MODES = {"auto", "sequential", "overlap"}
 _VALID_VISUAL_MODEL_BACKENDS = {"cosmos3", "internvl"}
+_VALID_CUT_DETECTION_BACKENDS = {
+    "auto",
+    "ffmpeg_cpu",
+    "ffmpeg_cuda",
+}
 
 # Printed during installation checks so mismatched revisions are obvious.
-SETTINGS_SCHEMA_VERSION = "walking_json_config_queue_retention_v10"
+SETTINGS_SCHEMA_VERSION = "walking_single_gpu_throughput_v20"
 
 
 def _config_value(name: str) -> Any:
@@ -169,7 +174,19 @@ DATA_DIR = Path(config_text("WALK_DATA_DIR")).expanduser()
 STATE_JSON = _data_child_path("WALK_STATE_JSON")
 OUTPUT_CSV = _data_child_path("WALK_OUTPUT_CSV")
 VIDEO_DIR = _data_child_path("WALK_VIDEO_DIR")
+VIDEO_TMP_DIR = _data_child_path("WALK_VIDEO_TMP_DIR")
 GEOCODE_CACHE_JSON = _data_child_path("WALK_GEOCODE_CACHE")
+
+_resolved_video_dir = VIDEO_DIR.resolve()
+_resolved_video_tmp_dir = VIDEO_TMP_DIR.resolve()
+if (
+    VIDEO_TMP_DIR.name != ".tmp"
+    or _resolved_video_dir not in _resolved_video_tmp_dir.parents
+):
+    raise ValueError(
+        "WALK_VIDEO_TMP_DIR must name a .tmp directory inside "
+        "WALK_VIDEO_DIR."
+    )
 
 _default_hf_home = (
     DATA_DIR.parent / "huggingface"
@@ -213,11 +230,27 @@ RESULTS_PER_PAGE = config_int(
 )
 MAX_NEW_CANDIDATES = config_optional_int("MAX_NEW_CANDIDATES")
 MAX_VIDEOS_PER_RUN = config_optional_int("MAX_VIDEOS_PER_RUN")
+CONTINUOUS_BATCH_MODE = config_bool("CONTINUOUS_BATCH_MODE")
+CONTINUOUS_BATCH_PAUSE_SECONDS = config_int(
+    "CONTINUOUS_BATCH_PAUSE_SECONDS", minimum=0
+)
+CONTINUOUS_IDLE_PAUSE_SECONDS = config_int(
+    "CONTINUOUS_IDLE_PAUSE_SECONDS", minimum=1
+)
 VIDEO_DOWNLOAD_QUEUE_SIZE = config_int(
     "VIDEO_DOWNLOAD_QUEUE_SIZE", minimum=1
 )
-KEEP_VIDEO_FILES_AFTER_ANALYSIS = config_bool(
-    "KEEP_VIDEO_FILES_AFTER_ANALYSIS"
+VIDEO_DOWNLOAD_FAILURE_ALLOWANCE_PER_RUN = config_int(
+    "VIDEO_DOWNLOAD_FAILURE_ALLOWANCE_PER_RUN", minimum=0
+)
+VIDEO_DOWNLOAD_MAX_CONSECUTIVE_FAILURES = config_int(
+    "VIDEO_DOWNLOAD_MAX_CONSECUTIVE_FAILURES", minimum=1
+)
+VIDEO_DOWNLOAD_STOP_ON_AUTH_ERROR = config_bool(
+    "VIDEO_DOWNLOAD_STOP_ON_AUTH_ERROR"
+)
+DELETE_VIDEO_AFTER_PROCESSING = config_bool(
+    "DELETE_VIDEO_AFTER_PROCESSING"
 )
 MIN_VIDEO_DURATION_SECONDS = config_int(
     "MIN_VIDEO_DURATION_SECONDS", minimum=1
@@ -248,6 +281,12 @@ COSMOS3_MODEL_NAME = config_text("COSMOS3_MODEL")
 COSMOS3_LOAD_IN_4BIT = config_bool("COSMOS3_4BIT")
 COSMOS3_MAX_NEW_TOKENS = config_int(
     "COSMOS3_MAX_NEW_TOKENS", minimum=1
+)
+COSMOS3_BATCH_SIZE = config_int(
+    "COSMOS3_BATCH_SIZE", minimum=1, maximum=8
+)
+CLIP_PREPARE_WORKERS = config_int(
+    "CLIP_PREPARE_WORKERS", minimum=1, maximum=8
 )
 COSMOS3_FAST_MODE = config_bool("COSMOS3_FAST_MODE")
 COSMOS3_INTRO_SEARCH_SECONDS = config_int(
@@ -290,13 +329,13 @@ COSMOS3_MAX_PROMOTION_FRACTION = config_float(
 )
 if VISUAL_MODEL_BACKEND == "cosmos3":
     VISUAL_REVIEW_VERSION = (
-        "cosmos3_nano_reasoner_location_metadata_v11"
+        "cosmos3_nano_reasoner_drone_aerial_exclusion_v13"
         if COSMOS3_FAST_MODE
-        else "cosmos3_nano_reasoner_hybrid_cuts_location_metadata_v11"
+        else "cosmos3_nano_reasoner_hybrid_cuts_drone_aerial_cuda_v13"
     )
 else:
     VISUAL_REVIEW_VERSION = (
-        f"{VISUAL_MODEL_BACKEND}_scene_cuts_location_metadata_v3"
+        f"{VISUAL_MODEL_BACKEND}_scene_cuts_drone_aerial_v4"
     )
 
 MIN_SEGMENT_DURATION_SECONDS = config_int(
@@ -342,10 +381,37 @@ WORKER_START_TIMEOUT_SECONDS = config_int(
 )
 
 VIDEO_FORMAT = config_text("WALK_VIDEO_FORMAT")
-_cookie_file = config_optional_text("YT_DLP_COOKIE_FILE")
-YT_DLP_COOKIE_FILE = (
-    str(Path(_cookie_file).expanduser()) if _cookie_file else ""
+YT_DLP_JS_RUNTIME = config_text("YT_DLP_JS_RUNTIME")
+YT_DLP_REMOTE_COMPONENT = config_text("YT_DLP_REMOTE_COMPONENT")
+YT_DLP_RETRIES = config_int("YT_DLP_RETRIES", minimum=0)
+YT_DLP_FRAGMENT_RETRIES = config_int(
+    "YT_DLP_FRAGMENT_RETRIES", minimum=0
 )
+YT_DLP_FILE_ACCESS_RETRIES = config_int(
+    "YT_DLP_FILE_ACCESS_RETRIES", minimum=0
+)
+YT_DLP_DOWNLOAD_ATTEMPTS = config_int(
+    "YT_DLP_DOWNLOAD_ATTEMPTS", minimum=1
+)
+YT_DLP_RETRY_SLEEP = config_text("YT_DLP_RETRY_SLEEP")
+YT_DLP_FRAGMENT_RETRY_SLEEP = config_text(
+    "YT_DLP_FRAGMENT_RETRY_SLEEP"
+)
+YT_DLP_HTTP_CHUNK_SIZE = config_text("YT_DLP_HTTP_CHUNK_SIZE")
+YT_DLP_SOCKET_TIMEOUT_SECONDS = config_int(
+    "YT_DLP_SOCKET_TIMEOUT_SECONDS", minimum=1
+)
+YT_DLP_DOWNLOAD_TIMEOUT_SECONDS = config_int(
+    "YT_DLP_DOWNLOAD_TIMEOUT_SECONDS", minimum=1
+)
+_cookie_file = config_optional_text("YT_DLP_COOKIE_FILE")
+if _cookie_file:
+    _cookie_path = Path(_cookie_file).expanduser()
+    if not _cookie_path.is_absolute():
+        _cookie_path = Path(root_dir) / _cookie_path
+    YT_DLP_COOKIE_FILE = str(_cookie_path)
+else:
+    YT_DLP_COOKIE_FILE = ""
 YT_DLP_COOKIES_FROM_BROWSER = (
     config_optional_text("YT_DLP_COOKIES_FROM_BROWSER") or ""
 )
@@ -360,6 +426,24 @@ SCENE_THRESHOLD = config_float(
 )
 SCDET_THRESHOLD = config_float(
     "SCDET_THRESHOLD", minimum=0.0, maximum=100.0
+)
+CUT_DETECTION_BACKEND = config_text("CUT_DETECTION_BACKEND").lower()
+if CUT_DETECTION_BACKEND not in _VALID_CUT_DETECTION_BACKENDS:
+    allowed_cut_backends = ", ".join(
+        sorted(_VALID_CUT_DETECTION_BACKENDS)
+    )
+    raise ValueError(
+        "CUT_DETECTION_BACKEND must be one of: "
+        f"{allowed_cut_backends}. Received: {CUT_DETECTION_BACKEND!r}"
+    )
+CUT_DETECTION_FPS = config_float(
+    "CUT_DETECTION_FPS", minimum=1.0, maximum=30.0
+)
+CUT_DETECTION_WIDTH = config_int(
+    "CUT_DETECTION_WIDTH", minimum=160, maximum=1920
+)
+CUT_DETECTION_CPU_FALLBACK = config_bool(
+    "CUT_DETECTION_CPU_FALLBACK"
 )
 MERGE_NEARBY_SEC = config_float("MERGE_NEARBY_SEC", minimum=0.0)
 IGNORE_FIRST_SEC = config_float("IGNORE_FIRST_SEC", minimum=0.0)

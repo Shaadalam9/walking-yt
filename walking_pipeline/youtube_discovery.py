@@ -9,7 +9,8 @@ from . import settings
 from .shared import clean_text, log, optional_text, save_state
 
 
-YOUTUBE_DISCOVERY_SCHEMA_VERSION = "walking_json_config_v1"
+YOUTUBE_DISCOVERY_SCHEMA_VERSION = "walking_continuous_batches_v2"
+DISCOVERY_PROGRESS_KEY = "youtube_discovery_progress"
 
 
 def load_api_keys() -> List[str]:
@@ -135,15 +136,44 @@ class YouTubeDiscovery:
         published_after = normalise_published_bound(settings.PUBLISHED_AFTER)
         published_before = normalise_published_bound(settings.PUBLISHED_BEFORE)
         videos: Dict[str, Any] = state.setdefault("videos", {})
+        progress = self._load_progress(state, queries)
+        pending = progress["pending_candidates"]
+        discovered_count = self._promote_pending_candidates(
+            pending, videos
+        )
         known_ids = set(videos)
-        discovered_count = 0
+        known_ids.update(
+            str(item.get("video_id"))
+            for item in pending
+            if isinstance(item, dict) and item.get("video_id")
+        )
+        if self._limit_reached(discovered_count):
+            save_state(state)
+            return discovered_count
 
-        for query in queries:
-            page_token: Optional[str] = None
+        page_tokens = progress["page_tokens"]
+        exhausted_queries = set(progress["exhausted_queries"])
+        query_count = len(queries)
+        start_index = int(progress["next_query_index"]) % query_count
+
+        for offset in range(query_count):
+            query_index = (start_index + offset) % query_count
+            query = queries[query_index]
+            if query in exhausted_queries:
+                continue
+
+            page_token = optional_text(page_tokens.get(query))
             log(f"YouTube API search: {query}")
 
             for _ in range(settings.MAX_PAGES_PER_QUERY):
                 if self._limit_reached(discovered_count):
+                    progress["next_query_index"] = (
+                        query_index + 1
+                    ) % query_count
+                    progress["exhausted_queries"] = sorted(
+                        exhausted_queries
+                    )
+                    save_state(state)
                     return discovered_count
 
                 def search_request(client: Any) -> Any:
@@ -171,25 +201,130 @@ class YouTubeDiscovery:
                     search_response, known_ids
                 )
                 if page_ids:
-                    discovered_count += self._save_video_details(
+                    candidate_records = self._load_video_details(
                         query=query,
                         page_ids=page_ids,
                         search_snippets=search_snippets,
-                        known_ids=known_ids,
-                        videos=videos,
-                        remaining_limit=self._remaining_limit(
-                            discovered_count
-                        ),
                     )
-                    save_state(state)
+                    if candidate_records is None:
+                        break
+
+                    remaining = self._remaining_limit(discovered_count)
+                    if remaining is None:
+                        accepted_records = candidate_records
+                        deferred_records: List[tuple[str, Dict[str, Any]]] = []
+                    else:
+                        accepted_records = candidate_records[:remaining]
+                        deferred_records = candidate_records[remaining:]
+
+                    for video_id, record in accepted_records:
+                        if video_id in videos:
+                            continue
+                        videos[video_id] = record
+                        known_ids.add(video_id)
+                        discovered_count += 1
+
+                    for video_id, record in deferred_records:
+                        if video_id in known_ids:
+                            continue
+                        pending.append(
+                            {"video_id": video_id, "record": record}
+                        )
+                        known_ids.add(video_id)
 
                 page_token = optional_text(
                     search_response.get("nextPageToken")
                 )
+                page_tokens[query] = page_token
                 if not page_token:
+                    exhausted_queries.add(query)
                     break
 
+                progress["next_query_index"] = (
+                    query_index + 1
+                ) % query_count
+                progress["exhausted_queries"] = sorted(
+                    exhausted_queries
+                )
+                save_state(state)
+
+                if self._limit_reached(discovered_count):
+                    return discovered_count
+
+            progress["next_query_index"] = (
+                query_index + 1
+            ) % query_count
+            progress["exhausted_queries"] = sorted(exhausted_queries)
+            save_state(state)
+
+        if len(exhausted_queries) == query_count:
+            progress["page_tokens"] = {}
+            progress["exhausted_queries"] = []
+            progress["next_query_index"] = 0
+            progress["completed_sweeps"] = (
+                int(progress.get("completed_sweeps", 0)) + 1
+            )
+            log(
+                "Completed a full YouTube search sweep. The next empty "
+                "batch check will start from the newest result pages."
+            )
+        save_state(state)
+
         return discovered_count
+
+    @staticmethod
+    def _load_progress(
+        state: Dict[str, Any], queries: List[str]
+    ) -> Dict[str, Any]:
+        progress = state.get(DISCOVERY_PROGRESS_KEY)
+        if (
+            not isinstance(progress, dict)
+            or progress.get("schema_version")
+            != YOUTUBE_DISCOVERY_SCHEMA_VERSION
+            or progress.get("queries") != queries
+        ):
+            progress = {
+                "schema_version": YOUTUBE_DISCOVERY_SCHEMA_VERSION,
+                "queries": list(queries),
+                "next_query_index": 0,
+                "page_tokens": {},
+                "exhausted_queries": [],
+                "pending_candidates": [],
+                "completed_sweeps": 0,
+            }
+            state[DISCOVERY_PROGRESS_KEY] = progress
+
+        if not isinstance(progress.get("page_tokens"), dict):
+            progress["page_tokens"] = {}
+        if not isinstance(progress.get("exhausted_queries"), list):
+            progress["exhausted_queries"] = []
+        if not isinstance(progress.get("pending_candidates"), list):
+            progress["pending_candidates"] = []
+        if not isinstance(progress.get("next_query_index"), int):
+            progress["next_query_index"] = 0
+        return progress
+
+    def _promote_pending_candidates(
+        self,
+        pending: List[Any],
+        videos: Dict[str, Any],
+    ) -> int:
+        promoted = 0
+        while pending and not self._limit_reached(promoted):
+            item = pending.pop(0)
+            if not isinstance(item, dict):
+                continue
+            video_id = optional_text(item.get("video_id"))
+            record = item.get("record")
+            if (
+                not video_id
+                or video_id in videos
+                or not isinstance(record, dict)
+            ):
+                continue
+            videos[video_id] = record
+            promoted += 1
+        return promoted
 
     @staticmethod
     def _new_page_ids(
@@ -212,15 +347,12 @@ class YouTubeDiscovery:
             )
         return page_ids, snippets
 
-    def _save_video_details(
+    def _load_video_details(
         self,
         query: str,
         page_ids: List[str],
         search_snippets: Dict[str, Dict[str, Any]],
-        known_ids: set[str],
-        videos: Dict[str, Any],
-        remaining_limit: Optional[int],
-    ) -> int:
+    ) -> Optional[List[tuple[str, Dict[str, Any]]]]:
         joined_ids = ",".join(page_ids)
 
         def details_request(client: Any) -> Any:
@@ -234,14 +366,14 @@ class YouTubeDiscovery:
             response = self.execute(details_request)
         except Exception as exc:
             log(f"Could not fetch video details: {exc}")
-            return 0
+            return None
 
-        saved = 0
+        records: List[tuple[str, Dict[str, Any]]] = []
         for item in response.get("items", []):
             if not isinstance(item, dict):
                 continue
             video_id = optional_text(item.get("id"))
-            if not video_id or video_id in known_ids:
+            if not video_id:
                 continue
 
             snippet = item.get("snippet", {})
@@ -255,14 +387,15 @@ class YouTubeDiscovery:
             if not video_duration_is_eligible(duration):
                 continue
 
-            videos[video_id] = self._new_video_record(
-                video_id, query, snippet, duration
+            records.append(
+                (
+                    video_id,
+                    self._new_video_record(
+                        video_id, query, snippet, duration
+                    ),
+                )
             )
-            known_ids.add(video_id)
-            saved += 1
-            if remaining_limit is not None and saved >= remaining_limit:
-                break
-        return saved
+        return records
 
     @staticmethod
     def _new_video_record(

@@ -12,7 +12,7 @@ from . import settings
 from .shared import normalise_string_list, optional_text
 
 
-OUTPUT_WRITER_SCHEMA_VERSION = "walking_bracket_csv_v2"
+OUTPUT_WRITER_SCHEMA_VERSION = "walking_incremental_location_csv_v3"
 _LOCATION_OUTPUT_COLUMNS = (
     "walking_environment",
     "timestamp_labels",
@@ -41,13 +41,24 @@ def resolved_output_columns() -> List[str]:
     return columns
 
 
-def location_key(location: Dict[str, Any]) -> str:
+def location_key(
+    location: Dict[str, Any], video_id: Optional[str] = None
+) -> str:
+    locality = optional_text(location.get("locality"))
+    lat = location.get("lat")
+    lon = location.get("lon")
+    if not locality and (lat is None or lon is None):
+        return json.dumps(
+            ["unresolved_video", video_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     values = [
-        optional_text(location.get("locality")),
+        locality,
         optional_text(location.get("state")),
         optional_text(location.get("country")),
-        location.get("lat"),
-        location.get("lon"),
+        lat,
+        lon,
     ]
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
@@ -135,7 +146,7 @@ def write_output_csv(state: Dict[str, Any]) -> None:
         if record.get("status") != "complete":
             continue
         location = _record_location(record)
-        key = location_key(location)
+        key = location_key(location, video_id)
         if key not in locality_ids:
             locality_ids[key] = next_id
             next_id += 1
@@ -148,17 +159,24 @@ def write_output_csv(state: Dict[str, Any]) -> None:
 
 def _record_location(record: Dict[str, Any]) -> Dict[str, Any]:
     location = record.get("location")
-    if isinstance(location, dict):
-        return location
+    if not isinstance(location, dict):
+        location = {}
+    decision = record.get("text_decision")
+    if not isinstance(decision, dict):
+        decision = {}
     return {
-        "locality": None,
-        "locality_aka": [],
-        "state": None,
-        "country": None,
-        "iso3": None,
-        "continent": None,
-        "lat": None,
-        "lon": None,
+        "locality": (
+            location.get("locality") or decision.get("locality")
+        ),
+        "locality_aka": location.get("locality_aka", []),
+        "state": location.get("state") or decision.get("state"),
+        "country": (
+            location.get("country") or decision.get("country")
+        ),
+        "iso3": location.get("iso3"),
+        "continent": location.get("continent"),
+        "lat": location.get("lat"),
+        "lon": location.get("lon"),
     }
 
 
