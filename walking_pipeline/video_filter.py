@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import torch  # type: ignore
+import torch
 
 from . import settings
 from .cut_detection import (
@@ -38,10 +38,13 @@ from .shared import (
 )
 
 
-VIDEO_FILTER_SCHEMA_VERSION = "walking_single_gpu_throughput_v20"
+VIDEO_FILTER_SCHEMA_VERSION = "walking_segment_retry_and_resume_v21"
 
 _TEMP_DIRECTORY_LOCK = threading.Lock()
 _TEMP_DIRECTORY_READY = False
+_VISUAL_JUDGE_LOCK = threading.Lock()
+_CACHED_VISUAL_JUDGE: Any = None
+_LOGGED_COOKIE_PATH: Optional[Path] = None
 
 _SEGMENT_CONTENT_TYPES = {
     "walking",
@@ -140,7 +143,6 @@ class DownloadProducerStats:
     failures: int = 0
     stop_reason: str = ""
 
-
 _DIRECT_EDIT_REASON_MARKERS = (
     "black screen",
     "title card",
@@ -223,7 +225,7 @@ def extract_description_timestamp_labels(
 
     chapter_regions: List[str] = []
     for heading in _CHAPTER_HEADING_PATTERN.finditer(description):
-        remainder = description[heading.end():]
+        remainder = description[heading.end() :]
         first_timestamp = _TIMESTAMP_PATTERN.search(remainder)
         if first_timestamp is None or first_timestamp.start() > 160:
             continue
@@ -243,7 +245,7 @@ def extract_description_timestamp_labels(
     labels: List[Dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     for index, match in enumerate(matches):
-        prefix = description[max(0, match.start() - 48): match.start()]
+        prefix = description[max(0, match.start() - 48) : match.start()]
         prefix = prefix.strip().lower()
         if any(
             marker in prefix
@@ -265,7 +267,7 @@ def extract_description_timestamp_labels(
             if index + 1 < len(matches)
             else len(description)
         )
-        raw_label = description[match.end(): next_start]
+        raw_label = description[match.end() : next_start]
         raw_label = re.split(
             r"(?:-{5,}|https?://|video duration\s*:|shooting time\s*:|"
             r"weather\s*:|watch also\s*:)",
@@ -509,8 +511,32 @@ def has_video_stream(media_path: Path) -> bool:
 
 def _yt_dlp_cookie_args() -> List[str]:
     """Build explicit cookie arguments without assuming a browser exists."""
-    if settings.YT_DLP_COOKIE_FILE:
-        return ["--cookies", settings.YT_DLP_COOKIE_FILE]
+    global _LOGGED_COOKIE_PATH
+
+    cookie_path: Optional[Path] = None
+    persistent_cookie_path = (
+        settings.DATA_DIR / "runtime-secrets" / "cookies.txt"
+    )
+    try:
+        persistent_cookie_ready = (
+            settings.SPIKE1_MODE
+            and persistent_cookie_path.is_file()
+            and persistent_cookie_path.stat().st_size > 0
+        )
+    except OSError:
+        # A cookie refresh may atomically replace the file while this check is
+        # running. Falling back for this call is safer than failing discovery.
+        persistent_cookie_ready = False
+    if persistent_cookie_ready:
+        cookie_path = persistent_cookie_path
+    elif settings.YT_DLP_COOKIE_FILE:
+        cookie_path = Path(settings.YT_DLP_COOKIE_FILE)
+
+    if cookie_path is not None:
+        if cookie_path != _LOGGED_COOKIE_PATH:
+            log(f"Using YouTube cookie file: {cookie_path}")
+            _LOGGED_COOKIE_PATH = cookie_path
+        return ["--cookies", str(cookie_path)]
     if settings.YT_DLP_COOKIES_FROM_BROWSER:
         return [
             "--cookies-from-browser",
@@ -1921,56 +1947,6 @@ class Cosmos3VisualJudge:
                 settings.COSMOS3_REVIEW_FPS,
             )[0]
         )
-        if (
-            data is None
-            or len(burst_content) != expected_burst_count
-            or "confidence" not in data
-            or "walking_environment" not in data
-            or "embedded_location_text" not in data
-        ):
-            log(
-                f"Cosmos 3 returned an incomplete classification for "
-                f"segment {segment_index}; retrying once"
-            )
-            retry_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "video", "path": str(sample_path)},
-                        {
-                            "type": "text",
-                            "text": (
-                                segment_prompt
-                                + "\n\nYour previous attempt was incomplete. "
-                                "Return exactly one complete JSON object with "
-                                f"exactly {expected_burst_count} "
-                                "burst_content labels in chronological order. Set "
-                                "embedded_location_text to an empty string. "
-                                "Keep short_reason to one sentence. "
-                                "Do not use Markdown fences."
-                            ),
-                        },
-                    ],
-                }
-            ]
-            try:
-                answer = self._generate(
-                    retry_messages,
-                    fps=settings.COSMOS3_REVIEW_FPS,
-                )
-            except Exception as exc:
-                return InternVLVisualJudge._segment_error(
-                    segment_index,
-                    start_time,
-                    end_time,
-                    "model_error",
-                    f"Cosmos 3 JSON retry failed: {exc}",
-                    answer,
-                )
-            data = recover_json(answer)
-            burst_content = self._normalise_burst_content(
-                data.get("burst_content") if data else None
-            )
         if data is None:
             return InternVLVisualJudge._segment_error(
                 segment_index,
@@ -1987,6 +1963,25 @@ class Cosmos3VisualJudge:
                 end_time,
                 "invalid_burst_content",
                 "Cosmos 3 did not classify every motion burst.",
+                answer,
+            )
+        required_fields = {
+            "confidence",
+            "walking_environment",
+            "embedded_location_text",
+        }
+        missing_fields = sorted(required_fields.difference(data))
+        if missing_fields:
+            return InternVLVisualJudge._segment_error(
+                segment_index,
+                start_time,
+                end_time,
+                "incomplete_response",
+                (
+                    "Cosmos 3 omitted required field(s): "
+                    + ", ".join(missing_fields)
+                    + "."
+                ),
                 answer,
             )
 
@@ -2333,6 +2328,28 @@ def create_visual_judge(device: str | None = None) -> Any:
     return InternVLVisualJudge(settings.VLM_MODEL_NAME, device=device)
 
 
+def acquire_visual_judge(device: str | None = None) -> Any:
+    """Create or reuse the visual model for consecutive pipeline cycles."""
+    global _CACHED_VISUAL_JUDGE
+
+    if not settings.KEEP_VISUAL_MODEL_LOADED:
+        return create_visual_judge(device=device)
+
+    with _VISUAL_JUDGE_LOCK:
+        if _CACHED_VISUAL_JUDGE is None:
+            _CACHED_VISUAL_JUDGE = create_visual_judge(device=device)
+        else:
+            log("Reusing the loaded visual model from the previous cycle")
+        return _CACHED_VISUAL_JUDGE
+
+
+def release_visual_judge(judge: Any) -> None:
+    """Unload noncached judges while retaining the continuous mode model."""
+    if settings.KEEP_VISUAL_MODEL_LOADED and judge is _CACHED_VISUAL_JUDGE:
+        return
+    unload_model(judge)
+
+
 def verify_cut_candidates(
     video_id: str,
     video_path: Path,
@@ -2389,7 +2406,7 @@ def verify_cut_candidates(
 
             for batch_start in range(0, len(prepared), batch_size):
                 batch_entries = prepared[
-                    batch_start: batch_start + batch_size
+                    batch_start : batch_start + batch_size
                 ]
                 batch_jobs: List[CutReviewJob] = []
                 batch_job_indices: List[int] = []
@@ -2488,6 +2505,84 @@ def verified_cut_times(
         and verification.is_real_cut
         and verification.confidence >= settings.MIN_CUT_CONFIDENCE
     ]
+
+
+def _skipped_segment_after_analysis_failure(
+    review: SegmentReview,
+    attempt_count: int,
+) -> SegmentReview:
+    """Turn a final segment error into a terminal, excluded review."""
+    failure_code = clean_text(review.error) or "unknown_error"
+    reason = clean_text(review.short_reason) or "No error detail was returned."
+    return SegmentReview(
+        segment_index=review.segment_index,
+        start_time=review.start_time,
+        end_time=review.end_time,
+        include=False,
+        confidence=0.0,
+        is_walking_video=False,
+        content_type="unclear",
+        is_advertisement=False,
+        is_intro_highlights=False,
+        time_of_day="unknown",
+        quality_issues=[
+            "segment_analysis_skipped",
+            failure_code,
+        ],
+        short_reason=(
+            f"Segment analysis failed after {attempt_count} attempt(s) and "
+            f"was skipped. Last error: {reason}"
+        ),
+        raw_response=review.raw_response,
+        decision_method="analysis_failure_skip",
+        walking_environment="not_applicable",
+        error=None,
+    )
+
+
+def _retry_failed_segment_review(
+    judge: Any,
+    job: SegmentReviewJob,
+    review: SegmentReview,
+) -> SegmentReview:
+    """Retry a failed VLM segment review, then return a terminal skip."""
+    attempt_count = 1
+    for retry_number in range(1, settings.SEGMENT_ANALYSIS_RETRIES + 1):
+        if review.error is None:
+            break
+        log(
+            f"Segment {job.segment_index} analysis failed with "
+            f"{review.error}; retrying ({retry_number}/"
+            f"{settings.SEGMENT_ANALYSIS_RETRIES})"
+        )
+        attempt_count += 1
+        try:
+            review = judge.judge_segment(
+                job.sample_path,
+                job.metadata,
+                job.segment_index,
+                job.segment_count,
+                job.start_time,
+                job.end_time,
+                job.video_duration,
+            )
+        except Exception as exc:
+            review = InternVLVisualJudge._segment_error(
+                job.segment_index,
+                job.start_time,
+                job.end_time,
+                "model_error",
+                str(exc),
+            )
+
+    if review.error is None:
+        return review
+
+    log(
+        f"Segment {job.segment_index} still failed after {attempt_count} "
+        "attempt(s); skipping this segment and continuing the video"
+    )
+    return _skipped_segment_after_analysis_failure(review, attempt_count)
 
 
 def review_segments(
@@ -2660,13 +2755,11 @@ def review_segments(
                     f"Cosmos batch size={batch_size}"
                 )
 
-            stop_after_index: Optional[int] = None
             for batch_start in range(0, len(prepared), batch_size):
                 batch_entries = prepared[
-                    batch_start: batch_start + batch_size
+                    batch_start : batch_start + batch_size
                 ]
                 batch_jobs: List[SegmentReviewJob] = []
-                batch_job_indices: List[int] = []
 
                 for (
                     segment_index,
@@ -2683,23 +2776,59 @@ def review_segments(
                             f"Segment {segment_index} clip preparation "
                             f"failed: {exc}"
                         )
-                    if not clip_ready:
-                        reviews_by_index[segment_index] = (
-                            InternVLVisualJudge._segment_error(
-                                segment_index,
+                    clip_attempt_count = 1
+                    for retry_number in range(
+                        1,
+                        settings.SEGMENT_ANALYSIS_RETRIES + 1,
+                    ):
+                        if clip_ready:
+                            break
+                        log(
+                            f"Segment {segment_index} clip preparation "
+                            f"failed; retrying ({retry_number}/"
+                            f"{settings.SEGMENT_ANALYSIS_RETRIES})"
+                        )
+                        clip_attempt_count += 1
+                        try:
+                            clip_ready = create_segment_review_clip(
+                                video_path,
                                 start_time,
                                 end_time,
-                                "clip_creation_failed",
-                                (
-                                    "FFmpeg could not create the segment "
-                                    "review clip."
+                                sample_path,
+                                target_frame_count=getattr(
+                                    judge,
+                                    "frames_per_sample",
+                                    settings.FRAMES_PER_SAMPLE,
+                                ),
+                                maximum_width=getattr(
+                                    judge,
+                                    "maximum_width",
+                                    480,
                                 ),
                             )
+                        except Exception as exc:
+                            clip_ready = False
+                            log(
+                                f"Segment {segment_index} clip retry "
+                                f"failed: {exc}"
+                            )
+                    if not clip_ready:
+                        reviews_by_index[segment_index] = (
+                            _skipped_segment_after_analysis_failure(
+                                InternVLVisualJudge._segment_error(
+                                    segment_index,
+                                    start_time,
+                                    end_time,
+                                    "clip_creation_failed",
+                                    (
+                                        "FFmpeg could not create the segment "
+                                        "review clip."
+                                    ),
+                                ),
+                                clip_attempt_count,
+                            )
                         )
-                        if stop_after_index is None:
-                            stop_after_index = segment_index
                         continue
-                    batch_job_indices.append(segment_index)
                     batch_jobs.append(
                         SegmentReviewJob(
                             sample_path=sample_path,
@@ -2730,28 +2859,36 @@ def review_segments(
                             )
                             for job in batch_jobs
                         ]
-                    for segment_index, review in zip(
-                        batch_job_indices,
+                    for job, review in zip(
+                        batch_jobs,
                         reviewed_batch,
                     ):
-                        reviews_by_index[segment_index] = review
-                        if review.error is not None and (
-                            stop_after_index is None
-                            or segment_index < stop_after_index
-                        ):
-                            stop_after_index = segment_index
+                        reviews_by_index[job.segment_index] = (
+                            _retry_failed_segment_review(
+                                judge,
+                                job,
+                                review,
+                            )
+                        )
 
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                if stop_after_index is not None:
-                    break
-
     reviews: List[SegmentReview] = []
     for segment_index in range(segment_count):
         review = reviews_by_index.get(segment_index)
         if review is None:
-            break
+            segment = segments[segment_index]
+            review = _skipped_segment_after_analysis_failure(
+                InternVLVisualJudge._segment_error(
+                    segment_index,
+                    int(segment["start_time"]),
+                    int(segment["end_time"]),
+                    "missing_segment_result",
+                    "No segment result was produced.",
+                ),
+                1 + settings.SEGMENT_ANALYSIS_RETRIES,
+            )
         review.timestamp_labels = timestamp_labels_by_index[segment_index]
         review.location_source = segment_location_source(
             review.timestamp_labels,
@@ -3022,6 +3159,87 @@ def aggregate_segment_reviews(
     }
 
 
+def _apply_segment_reviews(
+    video_id: str,
+    record: Dict[str, Any],
+    video_path: Path,
+    duration: float,
+    review_metadata: Dict[str, Any],
+    candidate_segments: List[Dict[str, Any]],
+    judge: Any,
+    prior_reviews: List[Dict[str, Any]],
+) -> None:
+    """Review candidate segments and write a terminal video decision."""
+    reviews = review_segments(
+        video_id,
+        video_path,
+        duration,
+        review_metadata,
+        candidate_segments,
+        judge,
+        prior_reviews,
+    )
+    failed_reviews = [
+        review for review in reviews if review.error is not None
+    ]
+    if failed_reviews:
+        log(
+            f"Converting {len(failed_reviews)} unexpected failed segment "
+            "review(s) to terminal skips"
+        )
+        reviews = [
+            (
+                _skipped_segment_after_analysis_failure(
+                    review,
+                    1 + settings.SEGMENT_ANALYSIS_RETRIES,
+                )
+                if review.error is not None
+                else review
+            )
+            for review in reviews
+        ]
+
+    visual_decision = aggregate_segment_reviews(reviews)
+    record["visual_decision"] = visual_decision
+    record["segments"] = accepted_segments_from_reviews(reviews)
+
+    if not visual_decision.get("include"):
+        record["status"] = (
+            "visual_error"
+            if visual_decision.get("error")
+            else "visual_rejected"
+        )
+        record["error"] = visual_decision.get("error")
+        return
+
+    record["status"] = "complete"
+    record["error"] = None
+
+
+def _candidate_segments_from_prior_reviews(
+    prior_reviews: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Recover saved segment boundaries for an interrupted video review."""
+    candidate_segments: List[Dict[str, Any]] = []
+    for value in prior_reviews:
+        if not isinstance(value, dict):
+            return []
+        try:
+            start_time = int(value["start_time"])
+            end_time = int(value["end_time"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        if start_time < 0 or end_time <= start_time:
+            return []
+        candidate_segments.append(
+            {
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        )
+    return candidate_segments
+
+
 def _process_visual_candidate(
     video_id: str,
     record: Dict[str, Any],
@@ -3071,6 +3289,24 @@ def _process_visual_candidate(
         record["error"] = (
             "downloaded video is shorter than "
             f"{settings.MIN_VIDEO_DURATION_SECONDS} seconds"
+        )
+        return
+
+    resumed_segments = _candidate_segments_from_prior_reviews(prior_reviews)
+    if resumed_segments:
+        log(
+            f"Resuming {video_id} from {len(prior_reviews)} saved segment "
+            "review(s); skipping repeated content and cut detection"
+        )
+        _apply_segment_reviews(
+            video_id,
+            record,
+            video_path,
+            duration,
+            review_metadata,
+            resumed_segments,
+            judge,
+            prior_reviews,
         )
         return
 
@@ -3210,8 +3446,9 @@ def _process_visual_candidate(
     record["cuts"]["maximum_review_window_seconds"] = (
         settings.MAX_SEGMENT_REVIEW_SECONDS
     )
-    reviews = review_segments(
+    _apply_segment_reviews(
         video_id,
+        record,
         video_path,
         duration,
         review_metadata,
@@ -3219,33 +3456,6 @@ def _process_visual_candidate(
         judge,
         prior_reviews,
     )
-    failed_reviews = [
-        review for review in reviews if review.error is not None
-    ]
-    if failed_reviews:
-        record["visual_decision"] = aggregate_segment_reviews(reviews)
-        record["segments"] = []
-        record["status"] = "segment_review_failed"
-        record["error"] = (
-            f"{len(failed_reviews)} segment review call(s) failed"
-        )
-        return
-
-    visual_decision = aggregate_segment_reviews(reviews)
-    record["visual_decision"] = visual_decision
-    record["segments"] = accepted_segments_from_reviews(reviews)
-
-    if not visual_decision.get("include"):
-        record["status"] = (
-            "visual_error"
-            if visual_decision.get("error")
-            else "visual_rejected"
-        )
-        record["error"] = visual_decision.get("error")
-        return
-
-    record["status"] = "complete"
-    record["error"] = None
 
 
 _FINISHED_ANALYSIS_STATUSES = {"complete", "visual_rejected"}
@@ -3537,7 +3747,7 @@ def run_visual_stage(
     processed = 0
     download_failures = 0
     try:
-        judge = create_visual_judge()
+        judge = acquire_visual_judge()
         initial_target = min(queue_capacity, visual_budget, len(pending))
         _wait_for_initial_download_buffer(
             ready_queue,
@@ -3592,7 +3802,7 @@ def run_visual_stage(
             after_video,
         )
         if judge is not None:
-            unload_model(judge)
+            release_visual_judge(judge)
     log(
         f"Visual download summary: analysed={processed}, "
         f"download_failed={download_failures}, "

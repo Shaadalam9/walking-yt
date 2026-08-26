@@ -24,7 +24,7 @@ _VALID_CUT_DETECTION_BACKENDS = {
 }
 
 # Printed during installation checks so mismatched revisions are obvious.
-SETTINGS_SCHEMA_VERSION = "walking_single_gpu_throughput_v20"
+SETTINGS_SCHEMA_VERSION = "walking_segment_retry_and_resume_v21"
 
 
 def _config_value(name: str) -> Any:
@@ -288,6 +288,10 @@ COSMOS3_BATCH_SIZE = config_int(
 CLIP_PREPARE_WORKERS = config_int(
     "CLIP_PREPARE_WORKERS", minimum=1, maximum=8
 )
+SEGMENT_ANALYSIS_RETRIES = config_int(
+    "SEGMENT_ANALYSIS_RETRIES", minimum=0, maximum=5
+)
+KEEP_VISUAL_MODEL_LOADED = config_bool("KEEP_VISUAL_MODEL_LOADED")
 COSMOS3_FAST_MODE = config_bool("COSMOS3_FAST_MODE")
 COSMOS3_INTRO_SEARCH_SECONDS = config_int(
     "COSMOS3_INTRO_SEARCH_SECONDS", minimum=15
