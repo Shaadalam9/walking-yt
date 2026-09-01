@@ -38,7 +38,7 @@ from .shared import (
 )
 
 
-VIDEO_FILTER_SCHEMA_VERSION = "walking_segment_retry_and_resume_v21"
+VIDEO_FILTER_SCHEMA_VERSION = "walking_youtube_player_client_v22"
 
 _TEMP_DIRECTORY_LOCK = threading.Lock()
 _TEMP_DIRECTORY_READY = False
@@ -561,6 +561,8 @@ def _yt_dlp_download_command(
         settings.YT_DLP_JS_RUNTIME,
         "--remote-components",
         settings.YT_DLP_REMOTE_COMPONENT,
+        "--extractor-args",
+        settings.YT_DLP_EXTRACTOR_ARGS,
         "--retries",
         str(settings.YT_DLP_RETRIES),
         "--fragment-retries",

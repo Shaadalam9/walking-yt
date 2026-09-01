@@ -24,7 +24,7 @@ _VALID_CUT_DETECTION_BACKENDS = {
 }
 
 # Printed during installation checks so mismatched revisions are obvious.
-SETTINGS_SCHEMA_VERSION = "walking_segment_retry_and_resume_v21"
+SETTINGS_SCHEMA_VERSION = "walking_youtube_player_client_v22"
 
 
 def _config_value(name: str) -> Any:
@@ -235,7 +235,7 @@ CONTINUOUS_BATCH_PAUSE_SECONDS = config_int(
     "CONTINUOUS_BATCH_PAUSE_SECONDS", minimum=0
 )
 CONTINUOUS_IDLE_PAUSE_SECONDS = config_int(
-    "CONTINUOUS_IDLE_PAUSE_SECONDS", minimum=1
+    "CONTINUOUS_IDLE_PAUSE_SECONDS", minimum=0
 )
 VIDEO_DOWNLOAD_QUEUE_SIZE = config_int(
     "VIDEO_DOWNLOAD_QUEUE_SIZE", minimum=1
@@ -387,6 +387,7 @@ WORKER_START_TIMEOUT_SECONDS = config_int(
 VIDEO_FORMAT = config_text("WALK_VIDEO_FORMAT")
 YT_DLP_JS_RUNTIME = config_text("YT_DLP_JS_RUNTIME")
 YT_DLP_REMOTE_COMPONENT = config_text("YT_DLP_REMOTE_COMPONENT")
+YT_DLP_EXTRACTOR_ARGS = config_text("YT_DLP_EXTRACTOR_ARGS")
 YT_DLP_RETRIES = config_int("YT_DLP_RETRIES", minimum=0)
 YT_DLP_FRAGMENT_RETRIES = config_int(
     "YT_DLP_FRAGMENT_RETRIES", minimum=0

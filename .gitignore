@@ -19,3 +19,6 @@ www.youtube.com_cookies.txt
 # Operating system files
 .DS_Storecookies.txt
 /cookies.txt
+
+# Big files
+walking_pipeline_state.json
