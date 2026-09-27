@@ -11,6 +11,7 @@ secret
 config
 .env
 *.env
+.venv
 
 # Data files
 data
@@ -22,3 +23,5 @@ www.youtube.com_cookies.txt
 
 # Big files
 walking_pipeline_state.json
+
+_output
